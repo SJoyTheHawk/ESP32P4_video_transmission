@@ -1,0 +1,33 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "idf.adapterTargetName": "esp32p4",
+    "idf.customExtraPaths": "d:\\Soft_APP\\Espressif\\tools\\tools\\xtensa-esp-elf-gdb\\14.2_20240403\\xtensa-esp-elf-gdb\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\riscv32-esp-elf-gdb\\14.2_20240403\\riscv32-esp-elf-gdb\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\riscv32-esp-elf\\esp-13.2.0_20240530\\riscv32-esp-elf\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\esp32ulp-elf\\2.38_20240113\\esp32ulp-elf\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\cmake\\3.24.0\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\openocd-esp32\\v0.12.0-esp32-20240726\\openocd-esp32\\bin;d:\\Soft_APP\\Espressif\\tools\\tools\\ninja\\1.11.1;d:\\Soft_APP\\Espressif\\tools\\tools\\idf-exe\\1.0.3;d:\\Soft_APP\\Espressif\\tools\\tools\\ccache\\4.8\\ccache-4.8-windows-x86_64;d:\\Soft_APP\\Espressif\\tools\\tools\\dfu-util\\0.11\\dfu-util-0.11-win64;d:\\Soft_APP\\Espressif\\tools\\tools\\esp-rom-elfs\\20240305",
+    "idf.customExtraVars": {
+        "OPENOCD_SCRIPTS": "d:\\Soft_APP\\Espressif\\tools\\tools\\openocd-esp32\\v0.12.0-esp32-20240726/openocd-esp32/share/openocd/scripts",
+        "IDF_CCACHE_ENABLE": "1",
+        "ESP_ROM_ELF_DIR": "d:\\Soft_APP\\Espressif\\tools\\tools\\esp-rom-elfs\\20240305/"
+    },
+    "idf.espIdfPathWin": "D:/soft/ESP32/Espressif/frameworks/esp-idf-v5.5.1/",
+    "idf.openOcdConfigs": [
+        "board/esp32p4-builtin.cfg"
+    ],
+    "idf.portWin": "COM7",
+    "idf.pythonBinPathWin": "d:\\Soft_APP\\Espressif\\tools\\python_env\\idf5.4_py3.11_env\\Scripts\\python.exe",
+    "idf.toolsPathWin": "e:\\software\\esp32\\Espressif\\tools",
+    "files.associations": {
+		"freertos.h": "c",
+		"esp_log.h": "c",
+		"stdio.h": "c",
+		"led.h": "c",
+		"key.h": "c",
+		"videodev2.h": "c",
+		"mman.h": "c",
+		"nvs_flash.h": "c"
+	},
+    "idf.flashType": "UART",
+    "C_Cpp.errorSquiggles": "disabled",
+    "files.autoGuessEncoding": true,
+	"idf.gitPathWin": "d:\\Soft_APP\\Espressif\\tools\\tools\\idf-git\\2.39.2\\cmd\\git.exe",
+    "idf.pythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+    "idf.currentSetup": "/Users/szemy/.espressif/v5.5.5/esp-idf"
+}
