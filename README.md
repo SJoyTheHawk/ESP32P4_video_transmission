@@ -1,4 +1,4 @@
-##ESP32P4 Video Transmission
+ESP32P4 Video Transmission
 Board: ESP32-P4 CB V1.3
 Camera: OV5647 MIPI-CSI
 Wireless: ESP32-C6 via ESP-Hosted SDIO
