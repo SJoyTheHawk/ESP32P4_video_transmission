@@ -1,4 +1,4 @@
-fqbn_append: PartitionScheme=esp_sr_16,FlashSize=16M
+fqbn_append: PartitionScheme=esp_sr_16,FlashSize=16M,PSRAM=enabled
 
 requires:
   - CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y

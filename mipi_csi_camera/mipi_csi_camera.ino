@@ -29,10 +29,15 @@
  * buffer validation, and a lightweight sampled frame hash.
  */
 
+// #define EXCLUDE_WIFI  // Uncomment to disable ESP-Hosted Wi-Fi for bring-up
+
 #include "Arduino.h"
 #include <ESP_Video.h>
-#include <HTTPClient.h>
+#include "jpeg_encoder.h"
+
+#ifndef EXCLUDE_WIFI
 #include <WiFi.h>
+#endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
 #if CONFIG_IDF_TARGET_ESP32P4
@@ -46,6 +51,7 @@
 #define EXAMPLE_MIPI_CSI_SENSOR_RESET_PIN 26
 #define EXAMPLE_MIPI_CSI_SENSOR_PWDN_PIN  27
 
+#ifndef EXCLUDE_WIFI
 /**
  * @brief ESP32-P4 CB V1.3 connection to the ESP32-C6 Wi-Fi coprocessor.
  *
@@ -61,13 +67,13 @@
 #define EXAMPLE_C6_WAKE_PIN          12
 #define EXAMPLE_C6_ENABLE_PIN        19
 
-// Fill these values before testing Wi-Fi association and the PC health check.
-// Leaving the SSID empty keeps the camera test usable without network access.
+// Fill these values before testing Wi-Fi association.
 const char *kWifiSsid = "";
 const char *kWifiPassword = "";
-const char *kReceiverHost = "192.168.1.127";
-const uint16_t kReceiverPort = 8080;
 const uint32_t kWifiConnectTimeoutMs = 15000;
+const char *kReceiverHost = "192.168.1.152";
+const uint16_t kReceiverPort = 5001;
+#endif
 #else
 #error "The selected target SoC is not supported"
 #endif
@@ -80,6 +86,13 @@ ESPVideoCaptureDevClass capture_dev;
 const size_t kCaptureBufferCount = 2;
 const uint32_t kFrameLogInterval = 50;
 const size_t kFrameSampleCount = 64;
+const uint32_t kJpegQuality = 80;
+const uint32_t kJpegIntervalMs = 1000;
+
+JpegEncoderClass jpeg_encoder;
+#ifndef EXCLUDE_WIFI
+WiFiClient stream_client;
+#endif
 
 static uint32_t sampleFrameHash(const uint8_t *data, size_t length) {
   if (data == nullptr || length == 0) {
@@ -97,6 +110,43 @@ static uint32_t sampleFrameHash(const uint8_t *data, size_t length) {
   }
 
   return hash;
+}
+
+#ifndef EXCLUDE_WIFI
+static bool writeAll(WiFiClient &client, const uint8_t *data, size_t size) {
+  while (size > 0) {
+    size_t written = client.write(data, size);
+    if (written == 0) {
+      return false;
+    }
+    data += written;
+    size -= written;
+  }
+  return true;
+}
+
+static void writeUint16Be(uint8_t *output, uint16_t value) {
+  output[0] = static_cast<uint8_t>(value >> 8);
+  output[1] = static_cast<uint8_t>(value);
+}
+
+static void writeUint32Be(uint8_t *output, uint32_t value) {
+  output[0] = static_cast<uint8_t>(value >> 24);
+  output[1] = static_cast<uint8_t>(value >> 16);
+  output[2] = static_cast<uint8_t>(value >> 8);
+  output[3] = static_cast<uint8_t>(value);
+}
+
+static bool sendJpegFrame(const JpegEncodeResult &jpeg, uint32_t sequence,
+                          uint16_t width, uint16_t height) {
+  uint8_t header[16] = {'J', 'P', 'G', '0'};
+  writeUint32Be(header + 4, sequence);
+  writeUint16Be(header + 8, width);
+  writeUint16Be(header + 10, height);
+  writeUint32Be(header + 12, jpeg.size);
+
+  return writeAll(stream_client, header, sizeof(header))
+         && writeAll(stream_client, jpeg.data, jpeg.size);
 }
 
 static bool initializeWirelessLink() {
@@ -125,8 +175,8 @@ static bool initializeWirelessLink() {
 
   Serial.println("ESP-Hosted SDIO transport initialized");
   if (kWifiSsid[0] == '\0') {
-    Serial.println("Wi-Fi association skipped: set kWifiSsid and kWifiPassword");
-    return true;
+    Serial.println("set kWifiSsid and kWifiPassword before the Wi-Fi test");
+    return false;
   }
 
   Serial.printf("connecting to Wi-Fi SSID '%s'\n", kWifiSsid);
@@ -148,37 +198,35 @@ static bool initializeWirelessLink() {
   Serial.print("Wi-Fi connected, IP=");
   Serial.println(WiFi.STA.localIP());
 
-  if (kReceiverHost[0] == '\0') {
-    Serial.println("PC health check skipped: set kReceiverHost");
-    return true;
-  }
-
-  String healthUrl = "http://" + String(kReceiverHost) + ":" + String(kReceiverPort) + "/health";
-  WiFiClient client;
-  HTTPClient http;
-  if (!http.begin(client, healthUrl)) {
-    Serial.println("failed to initialize PC health request");
+  Serial.printf("connecting to JPEG receiver %s:%u\n", kReceiverHost,
+                kReceiverPort);
+  if (!stream_client.connect(kReceiverHost, kReceiverPort)) {
+    Serial.println("failed to connect to JPEG receiver");
     return false;
   }
-
-  int statusCode = http.GET();
-  Serial.printf("PC health response: HTTP %d\n", statusCode);
-  http.end();
-  return statusCode >= 200 && statusCode < 300;
+  Serial.println("JPEG receiver connected");
+  return true;
 #else
   Serial.println("ESP-Hosted support is disabled in this Arduino core");
   return false;
 #endif
 }
+#endif
 
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
   Serial.println("OV5647 headless MIPI-CSI capture validation");
+  Serial.println("1 FPS continuous JPEG TCP transmission test enabled");
 
+#ifndef EXCLUDE_WIFI
   bool wirelessReady = initializeWirelessLink();
   Serial.printf("wireless validation: %s\n", wirelessReady ? "ready" : "not ready");
+  if (!wirelessReady) {
+    return;
+  }
+#endif
 
   ESPVideoCamConfigClass cam_config;
   if (!cam_config.begin(
@@ -219,7 +267,13 @@ void setup() {
     return;
   }
 
-  Serial.println("OV5647 capture started");
+  if (!jpeg_encoder.begin(capture_dev.getWidth(), capture_dev.getHeight(),
+                          kJpegQuality)) {
+    Serial.println("failed to initialize JPEG encoder");
+    return;
+  }
+
+  Serial.println("OV5647 capture and 1 FPS JPEG encode/send test started");
 }
 
 void loop() {
@@ -239,6 +293,8 @@ void loop() {
   static uint32_t invalidFrameCount = 0;
   static uint32_t lastLogFrame = 0;
   static uint32_t lastLogMillis = millis();
+  static uint32_t lastJpegMillis = 0;
+  static uint32_t jpegSequence = 0;
 
   const uint32_t width = frame.getWidth();
   const uint32_t height = frame.getHeight();
@@ -253,8 +309,39 @@ void loop() {
     ++invalidFrameCount;
   }
 
+  uint32_t now = millis();
+  if (validSize && (lastJpegMillis == 0 || now - lastJpegMillis >= kJpegIntervalMs)) {
+    lastJpegMillis = now;
+    JpegEncodeResult jpeg;
+    uint32_t encodeStartUs = micros();
+    bool encoded = jpeg_encoder.encode(frame.data(), expectedRgb565Size, &jpeg);
+    uint32_t encodeUs = micros() - encodeStartUs;
+    bool validJpeg = encoded && jpeg.size >= 4
+                     && jpeg.data[0] == 0xff && jpeg.data[1] == 0xd8
+                     && jpeg.data[jpeg.size - 2] == 0xff
+                     && jpeg.data[jpeg.size - 1] == 0xd9;
+    ++jpegSequence;
+    Serial.printf("jpeg sequence=%lu bytes=%lu encode_us=%lu valid=%s\n",
+                  static_cast<unsigned long>(jpegSequence),
+                  static_cast<unsigned long>(jpeg.size),
+                  static_cast<unsigned long>(encodeUs),
+                  validJpeg ? "yes" : "no");
+
+#ifndef EXCLUDE_WIFI
+    if (validJpeg) {
+      uint32_t writeStartUs = micros();
+      bool sent = sendJpegFrame(jpeg, jpegSequence, width, height);
+      uint32_t writeUs = micros() - writeStartUs;
+      Serial.printf("tcp sequence=%lu bytes=%lu write_us=%lu sent=%s\n",
+                    static_cast<unsigned long>(jpegSequence),
+                    static_cast<unsigned long>(jpeg.size),
+                    static_cast<unsigned long>(writeUs),
+                    sent ? "yes" : "no");
+    }
+#endif
+  }
+
   if (frameCount == 1 || frameCount - lastLogFrame >= kFrameLogInterval) {
-    uint32_t now = millis();
     uint32_t elapsed = now - lastLogMillis;
     float fps = elapsed > 0
               ? (1000.0f * (frameCount - lastLogFrame)) / elapsed
