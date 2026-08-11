@@ -68,10 +68,12 @@
 #define EXAMPLE_C6_ENABLE_PIN        19
 
 // Fill these values before testing Wi-Fi association.
-const char *kWifiSsid = "";
-const char *kWifiPassword = "";
+const char *kWifiSsid = "VPlace7B-4";
+const char *kWifiPassword = "60727269";
+// const char *kWifiSsid = "South Park";
+// const char *kWifiPassword = "qwerasdf";
 const uint32_t kWifiConnectTimeoutMs = 15000;
-const char *kReceiverHost = "192.168.1.152";
+const char *kReceiverHost = "192.168.1.183";
 const uint16_t kReceiverPort = 5001;
 #endif
 #else
@@ -87,7 +89,7 @@ const size_t kCaptureBufferCount = 2;
 const uint32_t kFrameLogInterval = 50;
 const size_t kFrameSampleCount = 64;
 const uint32_t kJpegQuality = 80;
-const uint32_t kJpegIntervalMs = 1000;
+const uint32_t kJpegIntervalMs = 100;
 
 JpegEncoderClass jpeg_encoder;
 #ifndef EXCLUDE_WIFI
@@ -218,7 +220,7 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.println("OV5647 headless MIPI-CSI capture validation");
-  Serial.println("1 FPS continuous JPEG TCP transmission test enabled");
+  Serial.println("10 FPS continuous JPEG TCP transmission test enabled");
 
 #ifndef EXCLUDE_WIFI
   bool wirelessReady = initializeWirelessLink();
@@ -273,7 +275,7 @@ void setup() {
     return;
   }
 
-  Serial.println("OV5647 capture and 1 FPS JPEG encode/send test started");
+  Serial.println("OV5647 capture and 10 FPS JPEG encode/send test started");
 }
 
 void loop() {
@@ -311,7 +313,11 @@ void loop() {
 
   uint32_t now = millis();
   if (validSize && (lastJpegMillis == 0 || now - lastJpegMillis >= kJpegIntervalMs)) {
-    lastJpegMillis = now;
+    if (lastJpegMillis == 0) {
+      lastJpegMillis = now;
+    } else {
+      lastJpegMillis += kJpegIntervalMs;
+    }
     JpegEncodeResult jpeg;
     uint32_t encodeStartUs = micros();
     bool encoded = jpeg_encoder.encode(frame.data(), expectedRgb565Size, &jpeg);

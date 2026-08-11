@@ -19,4 +19,15 @@
 ## Files
 
 - PC receiver: `tools/pc_receiver.py`
-- Implementation plan: `docs/OV5647_CAPTURE_VALIDATION_PLAN.md`
+- Implementation plan: `docs/OV5647_INCREMENTAL_JPEG_STREAM_PLAN.md`
+
+## PC Live Preview
+
+Start the receiver before the board:
+
+```bash
+python3 tools/pc_receiver.py --port 5001 --http-port 8080
+```
+
+Open `http://localhost:8080/` in a browser. JPEG frames remain in memory and are
+not written to disk.

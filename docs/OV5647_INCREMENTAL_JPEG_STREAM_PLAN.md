@@ -240,6 +240,12 @@ Acceptance:
 
 ## Stage 6 - Increase Stream Rate
 
+Status: passed on hardware at 5 and 10 JPEG FPS with quality 80. Camera capture
+remained stable at 35.74 FPS with no invalid frames, JPEG encoding remained near
+8.55 ms, and sender/receiver byte counts matched. At the 10 FPS setting, the PC
+received 500 sequence increments in 50.047177 seconds, or 9.991 FPS, without a
+growing backlog.
+
 Change only the requested JPEG rate between firmware burns:
 
 1. Test 5 FPS.
@@ -263,6 +269,10 @@ Acceptance:
 - Capture, encode, and send timing explain the complete cycle.
 
 ## Stage 7 - PC Live Preview
+
+Status: ready for hardware validation. The PC receiver now keeps TCP ingestion
+separate from an HTTP MJPEG preview at `/stream.mjpg`; frames remain in memory
+and disk recording remains disabled.
 
 Purpose: display the stream without changing the board transport.
 
