@@ -268,11 +268,26 @@ Acceptance:
 - Receiver FPS follows the configured rate without a growing backlog.
 - Capture, encode, and send timing explain the complete cycle.
 
+### Minimal Onboard Server Baseline
+
+Status: ready for hardware validation. The current test temporarily replaces
+the outbound `JPG0` connection with one synchronous HTTP MJPEG handler at
+`http://<board-ip>/`. The handler captures, encodes, and writes each frame in
+sequence using the existing single JPEG output buffer. It has no handoff queue,
+extra task, or Python server dependency.
+
+Acceptance:
+
+- One browser or Python client receives changing, valid JPEG frames.
+- Serial output reports encode and HTTP write time for every sequence.
+- Closing the client ends the handler without resetting the board.
+
 ## Stage 7 - PC Live Preview
 
-Status: ready for hardware validation. The PC receiver now keeps TCP ingestion
-separate from an HTTP MJPEG preview at `/stream.mjpg`; frames remain in memory
-and disk recording remains disabled.
+Status: awaiting a hardware retest. Initial preview testing correlated browser
+use with TCP writes as long as 1.28 seconds and capture falling from 31-34 FPS
+to 17-24 FPS. TCP ingestion now runs in a separate process from HTTP delivery,
+using a bounded, nonblocking latest-frame handoff and no disk recording.
 
 Purpose: display the stream without changing the board transport.
 

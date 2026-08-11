@@ -2,17 +2,21 @@
 """Receive length-framed JPEGs and expose the latest frame as an MJPEG stream."""
 
 import argparse
+import multiprocessing
 import socket
 import struct
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Full
 from time import time_ns
 
 
 HEADER = struct.Struct("!4sIHHI")
 MAGIC = b"JPG0"
 MJPEG_BOUNDARY = "frame"
+PREVIEW_QUEUE_DEPTH = 2
+DEFAULT_TCP_RECEIVE_BUFFER = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,15 @@ def receive_exact(connection, size):
     return bytes(data)
 
 
-def receive_frames(connection, max_jpeg_bytes, latest_frame):
+def publish_preview_frame(frame_queue, sequence, width, height, jpeg):
+    try:
+        frame_queue.put_nowait((sequence, width, height, jpeg))
+    except Full:
+        # Preview is best-effort. TCP ingestion must never wait for a browser.
+        pass
+
+
+def receive_frames(connection, max_jpeg_bytes, frame_queue):
     latest_jpeg = None
     while True:
         header = receive_exact(connection, HEADER.size)
@@ -80,7 +92,7 @@ def receive_frames(connection, max_jpeg_bytes, latest_frame):
         valid = jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9")
         latest_jpeg = jpeg
         if valid:
-            latest_frame.publish(sequence, width, height, jpeg)
+            publish_preview_frame(frame_queue, sequence, width, height, jpeg)
         print(
             f"jpeg sequence={sequence} width={width} height={height} "
             f"bytes={jpeg_size} valid={'yes' if valid else 'no'} "
@@ -89,11 +101,19 @@ def receive_frames(connection, max_jpeg_bytes, latest_frame):
         )
 
 
-def receive_from_sender(server, max_jpeg_bytes, latest_frame):
+def receive_from_sender(server, max_jpeg_bytes, frame_queue, receive_buffer):
     connection, address = server.accept()
     with connection:
-        print(f"sender connected from {address[0]}:{address[1]}", flush=True)
-        receive_frames(connection, max_jpeg_bytes, latest_frame)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        actual_receive_buffer = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF
+        )
+        print(
+            f"sender connected from {address[0]}:{address[1]} "
+            f"receive_buffer={actual_receive_buffer}",
+            flush=True,
+        )
+        receive_frames(connection, max_jpeg_bytes, frame_queue)
 
 
 class PreviewHandler(BaseHTTPRequestHandler):
@@ -122,6 +142,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         version = 0
+        self.connection.settimeout(2.0)
         try:
             while True:
                 frame = self.server.latest_frame.wait_after(version)
@@ -138,7 +159,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
                 self.wfile.write(frame.jpeg)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        except OSError:
             return
 
     def log_message(self, _format, *_args):
@@ -151,6 +172,31 @@ class PreviewServer(ThreadingHTTPServer):
     def __init__(self, server_address, latest_frame):
         super().__init__(server_address, PreviewHandler)
         self.latest_frame = latest_frame
+
+
+def receive_preview_frames(frame_queue, latest_frame):
+    while True:
+        sequence, width, height, jpeg = frame_queue.get()
+        latest_frame.publish(sequence, width, height, jpeg)
+
+
+def run_preview_server(http_host, http_port, frame_queue):
+    latest_frame = LatestFrame()
+    receiver_thread = threading.Thread(
+        target=receive_preview_frames,
+        args=(frame_queue, latest_frame),
+        daemon=True,
+        name="preview-frame-receiver",
+    )
+    receiver_thread.start()
+
+    with PreviewServer((http_host, http_port), latest_frame) as preview_server:
+        actual_port = preview_server.server_address[1]
+        print(
+            f"MJPEG preview listening on http://{http_host}:{actual_port}/",
+            flush=True,
+        )
+        preview_server.serve_forever()
 
 
 def main():
@@ -173,37 +219,49 @@ def main():
         default=2 * 1024 * 1024,
         help="maximum accepted JPEG payload",
     )
+    parser.add_argument(
+        "--tcp-receive-buffer",
+        type=int,
+        default=DEFAULT_TCP_RECEIVE_BUFFER,
+        help="requested TCP receive-buffer size",
+    )
     args = parser.parse_args()
     http_host = args.http_host if args.http_host is not None else args.host
-    latest_frame = LatestFrame()
+    frame_queue = multiprocessing.Queue(maxsize=PREVIEW_QUEUE_DEPTH)
+    preview_process = multiprocessing.Process(
+        target=run_preview_server,
+        args=(http_host, args.http_port, frame_queue),
+        daemon=True,
+        name="mjpeg-preview",
+    )
+    preview_process.start()
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_server:
-        tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_server.bind((args.host, args.port))
-        tcp_server.listen(1)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_server:
+            tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tcp_server.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_RCVBUF,
+                args.tcp_receive_buffer,
+            )
+            tcp_server.bind((args.host, args.port))
+            tcp_server.listen(1)
 
-        preview_server = PreviewServer((http_host, args.http_port), latest_frame)
-        receiver_thread = threading.Thread(
-            target=receive_from_sender,
-            args=(tcp_server, args.max_jpeg_bytes, latest_frame),
-            daemon=True,
-            name="jpeg-tcp-receiver",
-        )
-        receiver_thread.start()
-
-        tcp_port = tcp_server.getsockname()[1]
-        http_port = preview_server.server_address[1]
-        print(f"JPEG receiver listening on {args.host}:{tcp_port}", flush=True)
-        print(
-            f"MJPEG preview listening on http://{http_host}:{http_port}/",
-            flush=True,
-        )
-        try:
-            preview_server.serve_forever()
-        except KeyboardInterrupt:
-            print("stopping", flush=True)
-        finally:
-            preview_server.server_close()
+            tcp_port = tcp_server.getsockname()[1]
+            print(f"JPEG receiver listening on {args.host}:{tcp_port}", flush=True)
+            receive_from_sender(
+                tcp_server,
+                args.max_jpeg_bytes,
+                frame_queue,
+                args.tcp_receive_buffer,
+            )
+    except KeyboardInterrupt:
+        print("stopping", flush=True)
+    finally:
+        if preview_process.is_alive():
+            preview_process.terminate()
+        preview_process.join(timeout=2.0)
+        frame_queue.cancel_join_thread()
 
 
 if __name__ == "__main__":
