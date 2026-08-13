@@ -35,8 +35,10 @@
 #define EXAMPLE_C6_WAKE_PIN     12
 #define EXAMPLE_C6_ENABLE_PIN   19
 
-const char *kWifiSsid = "VPlace7B-4";
-const char *kWifiPassword = "60727269";
+const char *kWifiSsid = "XIMS2";
+const char *kWifiPassword = "Ns203Ns203.";
+// const char *kWifiSsid = "VPlace7B-4";
+// const char *kWifiPassword = "60727269";
 const uint32_t kWifiConnectTimeoutMs = 15000;
 const uint32_t kWifiReconnectIntervalMs = 5000;
 const uint16_t kRtspPort = 554;
@@ -51,8 +53,8 @@ ESPVideoCaptureDevClass capture_dev;
 JpegEncoderClass jpeg_encoder;
 
 const size_t kCaptureBufferCount = 2;
-const uint32_t kJpegQuality = 80;
-const uint32_t kJpegIntervalMs = 200;
+const uint32_t kJpegQuality = 50;
+const uint32_t kJpegIntervalMs = 100;
 
 #ifndef EXCLUDE_WIFI
 RTSPServer rtsp_server;

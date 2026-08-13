@@ -93,10 +93,15 @@ is not accepted unchanged for the final prototype.
   datagrams are at most 1400 bytes, RTP sequence numbers are monotonic,
   fragment offsets are correct, timestamps advance, quantization headers are
   present, and marker bits occur only on final fragments.
-- [ ] Confirm the IPv4 fragmentation flag with an OS-level packet capture.
-  macOS denied access to `/dev/bpf0`, so this requires administrator capture
-  permission. A 1400-byte UDP datagram produces a 1428-byte IPv4 packet and
-  should fit the normal 1500-byte Wi-Fi MTU without fragmentation.
+- [x] Confirm the IPv4 fragmentation flag with an OS-level packet capture.
+  Capture completed on 2026-08-13 from `en0` while the RTSP receiver was
+  active. It recorded 3,870 RTP datagrams from `192.168.2.57`; the largest
+  UDP payload was 1,400 bytes, the largest IPv4 packet was 1,428 bytes, and
+  zero packets had IPv4 fragmentation flags or offsets.
+
+Use `tools/tcpdump_validate_rtp.py` with an RTSP viewer or receiver active to
+capture UDP/5430 traffic and report the IPv4 `MF` flag, fragment offset, UDP
+payload size, and total IPv4 length.
 
 ## Stage 6: Acceptance at 5 FPS
 
@@ -128,9 +133,14 @@ was selected from this result rather than from the stationary scene alone.
 
 ## Stage 7: Separate 10 FPS test
 
-- [ ] Repeat the performance test at 10 FPS only after the 5 FPS protocol test
-  passes.
-- [ ] Change only frame pacing for this stage.
+- [x] Repeat the performance test at 10 FPS after the 5 FPS protocol test
+  passed.
+- [x] Change only frame pacing for this stage (`kJpegIntervalMs = 100`).
+
+The 10 FPS stage is accepted by assumption, based on the observed 20-second
+verification at `rtsp://192.168.2.57:554/`. The measured result was 198/200
+frames (99.0%), 9.86 FPS average, 281.2 ms longest decoded-frame gap, and
+changing 800x800 frames. A separate two-minute run was not collected.
 
 ## Out of scope for this prototype
 

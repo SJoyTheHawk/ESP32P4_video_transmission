@@ -4,3 +4,5 @@ reference/17_mipicamera/sdkconfig.old
 tools/received_frames/
 __pycache__/
 *.py[cod]
+*.pcap
+*.pcapng
