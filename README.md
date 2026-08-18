@@ -80,9 +80,12 @@ The firmware prints its implementation identifier at boot as
 | `v3.0-phase2-arduino` | Arduino IDE | Bounded dequeue compatibility and JPEG resource lifecycle gates |
 | `v3.0-phase3-arduino` | Arduino IDE | CaptureController baseline-parity gates |
 | `v3.0-phase4-arduino` | Arduino IDE | 1080p RGB565 still transaction and baseline restoration |
+| `v3.0-phase5-arduino` | Arduino IDE | Immutable PhotoStore ownership and replacement stress gate |
+| `v3.0-phase6-arduino` | Arduino IDE | ESP-IDF HTTP photo API and asynchronous capture queue |
 
-The current sketch is `v3.0-phase4-arduino`. Its board acceptance procedures are
-documented in `docs/PHASE3_ARDUINO_TEST.md` and `docs/PHASE4_ARDUINO_TEST.md`.
+The current sketch is `v3.0-phase6-arduino`. Its board acceptance procedures are
+documented in `docs/PHASE3_ARDUINO_TEST.md`, `docs/PHASE4_ARDUINO_TEST.md`, and
+`docs/PHASE5_ARDUINO_TEST.md`, and `docs/PHASE6_ARDUINO_TEST.md`.
 V3's later high-resolution phases
 must receive a new identifier when their behavior changes; do not reuse a phase
 identifier for a different firmware image.

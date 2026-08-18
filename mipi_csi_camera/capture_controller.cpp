@@ -31,16 +31,18 @@ bool isSofMarker(uint8_t marker) {
 
 CaptureController::BaselineFrame::BaselineFrame(
   CaptureController *owner, uint8_t *data, size_t size, uint32_t width,
-  uint32_t height, uint32_t index)
+  uint32_t height, uint32_t index, bool operation_locked)
   : owner_(owner), data_(data), size_(size), width_(width), height_(height),
-    index_(index) {}
+    index_(index), operation_locked_(operation_locked) {}
 
 CaptureController::BaselineFrame::BaselineFrame(BaselineFrame &&other) noexcept
   : owner_(other.owner_), data_(other.data_), size_(other.size_),
-    width_(other.width_), height_(other.height_), index_(other.index_) {
+    width_(other.width_), height_(other.height_), index_(other.index_),
+    operation_locked_(other.operation_locked_) {
   other.owner_ = nullptr;
   other.data_ = nullptr;
   other.size_ = 0;
+  other.operation_locked_ = false;
 }
 
 CaptureController::BaselineFrame &CaptureController::BaselineFrame::operator=(
@@ -53,9 +55,11 @@ CaptureController::BaselineFrame &CaptureController::BaselineFrame::operator=(
     width_ = other.width_;
     height_ = other.height_;
     index_ = other.index_;
+    operation_locked_ = other.operation_locked_;
     other.owner_ = nullptr;
     other.data_ = nullptr;
     other.size_ = 0;
+    other.operation_locked_ = false;
   }
   return *this;
 }
@@ -72,12 +76,29 @@ uint32_t CaptureController::BaselineFrame::width() const { return width_; }
 uint32_t CaptureController::BaselineFrame::height() const { return height_; }
 
 void CaptureController::BaselineFrame::end() {
+  CaptureController *owner = owner_;
+  const bool operation_locked = operation_locked_;
   if (owner_ != nullptr && data_ != nullptr) {
     owner_->releaseBuffer(index_);
   }
   owner_ = nullptr;
   data_ = nullptr;
   size_ = 0;
+  operation_locked_ = false;
+  if (operation_locked && owner != nullptr && owner->operation_mutex_ != nullptr) {
+    xSemaphoreGive(owner->operation_mutex_);
+  }
+}
+
+CaptureController::CaptureController()
+  : operation_mutex_(xSemaphoreCreateMutex()) {}
+
+CaptureController::~CaptureController() {
+  end();
+  if (operation_mutex_ != nullptr) {
+    vSemaphoreDelete(operation_mutex_);
+    operation_mutex_ = nullptr;
+  }
 }
 
 bool CaptureController::beginBaseline(const char *device_path,
@@ -322,7 +343,17 @@ CaptureController::BaselineFrame CaptureController::captureBaselineFrame() {
   if (!isBaselineRunning()) {
     return BaselineFrame();
   }
-  return dequeueFrame();
+  if (operation_mutex_ == nullptr
+      || xSemaphoreTake(operation_mutex_, 0) != pdTRUE) {
+    return BaselineFrame();
+  }
+  BaselineFrame frame = dequeueFrame();
+  if (!frame.valid()) {
+    xSemaphoreGive(operation_mutex_);
+    return BaselineFrame();
+  }
+  frame.operation_locked_ = true;
+  return frame;
 }
 
 CaptureController::BaselineFrame CaptureController::dequeueFrame() {
@@ -338,7 +369,7 @@ CaptureController::BaselineFrame CaptureController::dequeueFrame() {
   const size_t size = buffer.bytesused == 0 ? buffer_len_[buffer.index]
                                              : buffer.bytesused;
   return BaselineFrame(this, buffer_ptr_[buffer.index], size, width_, height_,
-                       buffer.index);
+                       buffer.index, false);
 }
 
 bool CaptureController::encodeBaselineFrame(const BaselineFrame &frame,
@@ -355,7 +386,7 @@ bool CaptureController::runTimeoutRecoveryTest() {
   while (held_count < buffer_count_) {
     const uint32_t start_us = micros();
     errno = 0;
-    BaselineFrame candidate = captureBaselineFrame();
+    BaselineFrame candidate = dequeueFrame();
     const uint32_t elapsed_us = micros() - start_us;
     if (!candidate.valid()) {
       if (held_count == 0) {
@@ -372,7 +403,7 @@ bool CaptureController::runTimeoutRecoveryTest() {
   if (!timeout_observed) {
     const uint32_t start_us = micros();
     errno = 0;
-    BaselineFrame timed_out = captureBaselineFrame();
+    BaselineFrame timed_out = dequeueFrame();
     timeout_elapsed_us = micros() - start_us;
     driver_errno = errno;
     timeout_observed = !timed_out.valid();
@@ -383,7 +414,7 @@ bool CaptureController::runTimeoutRecoveryTest() {
   for (size_t i = 0; i < held_count; ++i) {
     held[i].end();
   }
-  BaselineFrame recovery = captureBaselineFrame();
+  BaselineFrame recovery = dequeueFrame();
   const bool recovered = recovery.valid();
   recovery.end();
   const bool ready = bounded && expected_errno && recovered;
@@ -548,6 +579,62 @@ bool CaptureController::restoreBaseline() {
   return true;
 }
 
+bool CaptureController::capture1080pStill(HighResStillCandidate *candidate) {
+  if (candidate == nullptr || !isBaselineRunning()) {
+    return false;
+  }
+  candidate->release();
+  if (operation_mutex_ == nullptr
+      || xSemaphoreTake(operation_mutex_, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+  if (!memoryGateFor1080p()) {
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  stopStream();
+  releaseBuffers();
+  jpeg_encoder_.end();
+  bool ready = applySensorFormat(ov5647_1080p_sensor_format(), true)
+               && width_ == kHighResWidth && height_ == kHighResHeight
+               && requestAndMapBuffers(kHighResBufferCount) && startStream();
+  if (ready) {
+    setState(CaptureControllerState::HighResReady);
+    ready = discardSettlingFrames(kHighResSettlingFrames);
+  }
+
+  JpegEncoderClass high_res_encoder;
+  JpegEncodeResult encoded;
+  if (ready) {
+    setState(CaptureControllerState::Capturing);
+    BaselineFrame frame = dequeueFrame();
+    ready = frame.valid() && frame.size() >= kHighResBufferBytes
+            && high_res_encoder.begin(width_, height_, kHighResJpegQuality)
+            && high_res_encoder.encode(frame.data(), kHighResBufferBytes, &encoded)
+            && jpegMatchesDimensions(encoded, width_, height_);
+    frame.end();
+  }
+  if (ready) {
+    candidate->jpeg = high_res_encoder.detachOutput();
+    candidate->size = encoded.size;
+    candidate->width = width_;
+    candidate->height = height_;
+    candidate->quality = kHighResJpegQuality;
+    candidate->captured_ms = millis();
+    ready = candidate->valid();
+  }
+  high_res_encoder.end();
+  const bool restored = restoreBaseline();
+  if (!ready || !restored) {
+    candidate->release();
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+  xSemaphoreGive(operation_mutex_);
+  return true;
+}
+
 bool CaptureController::run1080pCaptureValidation(uint32_t cycles) {
   if (!isBaselineRunning() || cycles == 0) {
     return false;
@@ -555,39 +642,9 @@ bool CaptureController::run1080pCaptureValidation(uint32_t cycles) {
   bool ready = true;
   uint32_t completed = 0;
   for (; completed < cycles && ready; ++completed) {
-    ready = memoryGateFor1080p();
-    if (!ready) {
-      break;
-    }
-    stopStream();
-    releaseBuffers();
-    jpeg_encoder_.end();
-    ready = applySensorFormat(ov5647_1080p_sensor_format(), completed == 0)
-            && width_ == kHighResWidth && height_ == kHighResHeight
-            && requestAndMapBuffers(kHighResBufferCount) && startStream();
-    if (ready) {
-      setState(CaptureControllerState::HighResReady);
-      ready = discardSettlingFrames(kHighResSettlingFrames);
-    }
-
-    JpegEncoderClass high_res_encoder;
-    JpegEncodeResult candidate;
-    if (ready) {
-      setState(CaptureControllerState::Capturing);
-      BaselineFrame frame = dequeueFrame();
-      const size_t expected_size = kHighResBufferBytes;
-      ready = frame.valid() && frame.size() >= expected_size
-              && high_res_encoder.begin(width_, height_, kHighResJpegQuality)
-              && high_res_encoder.encode(frame.data(), expected_size, &candidate)
-              && jpegMatchesDimensions(candidate, width_, height_);
-      frame.end();
-    }
-    high_res_encoder.end();
-    const bool restored = restoreBaseline();
-    ready = ready && restored;
-    if (!restored) {
-      break;
-    }
+    HighResStillCandidate candidate;
+    ready = capture1080pStill(&candidate);
+    candidate.release();
   }
   Serial.printf(
     "high-res capture validation status=%s completed=%lu requested=%lu state=%s\n",

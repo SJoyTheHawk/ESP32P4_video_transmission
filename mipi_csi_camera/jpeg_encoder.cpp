@@ -36,6 +36,15 @@ void JpegEncoderClass::end() {
   config_ = {};
 }
 
+DetachedJpegOutputBuffer JpegEncoderClass::detachOutput() {
+  if (handle_ != nullptr) {
+    jpeg_del_encoder_engine(handle_);
+    handle_ = nullptr;
+  }
+  config_ = {};
+  return output_.detach();
+}
+
 bool JpegEncoderClass::encode(const uint8_t *rgb565, uint32_t size,
                               JpegEncodeResult *result) {
   if (handle_ == nullptr || !output_.valid() || result == nullptr) {

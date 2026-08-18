@@ -18,6 +18,7 @@ public:
   bool allocate(size_t requested_size);
   void release();
   DetachedJpegOutputBuffer detach();
+  static void releaseDetached(DetachedJpegOutputBuffer detached);
 
   uint8_t *data() const;
   size_t capacity() const;

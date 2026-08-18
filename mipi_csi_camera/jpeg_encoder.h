@@ -15,6 +15,7 @@ public:
 
   bool begin(uint32_t width, uint32_t height, uint32_t quality);
   void end();
+  DetachedJpegOutputBuffer detachOutput();
   bool encode(const uint8_t *rgb565, uint32_t size, JpegEncodeResult *result);
 
 private:

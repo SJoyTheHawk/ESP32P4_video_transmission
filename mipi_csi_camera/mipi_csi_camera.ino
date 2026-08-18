@@ -13,6 +13,8 @@
 #include <esp_heap_caps.h>
 #include "capture_controller.h"
 #include "jpeg_output_buffer.h"
+#include "photo_store.h"
+#include "photo_api.h"
 
 #ifndef EXCLUDE_WIFI
 #include <WiFi.h>
@@ -51,12 +53,37 @@ const uint16_t kRtpVideoPort = 5430;
 #error "The selected target SoC is not supported"
 #endif
 
+struct MemorySnapshot {
+  size_t heap_free;
+  size_t heap_largest;
+  size_t psram_free;
+  size_t psram_largest;
+};
+
 ESPVideoClass video;
 CaptureController capture_controller;
+PhotoStore photo_store;
+PhotoApi photo_api;
+
+static bool capturePhotoForApi(void *) {
+  HighResStillCandidate candidate;
+  if (!capture_controller.capture1080pStill(&candidate)) {
+    return false;
+  }
+  DetachedJpegOutputBuffer detached = candidate.jpeg;
+  candidate.jpeg = {};
+  PhotoBlob *photo = PhotoBlob::create(
+    detached, candidate.size, candidate.width, candidate.height,
+    candidate.quality, candidate.captured_ms);
+  if (photo == nullptr) {
+    return false;
+  }
+  return photo_store.publish(photo);
+}
 
 // Keep this identifier stable within a phase so serial logs can be matched to
 // the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase4-arduino";
+static constexpr char kImplementationVersion[] = "v3.0-phase6-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
@@ -64,14 +91,9 @@ const uint32_t kBaselineReportIntervalMs = 5000;
 const uint32_t kCaptureDequeueTimeoutMs = 5000;
 const uint32_t kLifecycleTestCycles = 100;
 const uint32_t kHighResValidationCycles = 20;
+const uint32_t kPhotoStoreReplacementCycles = 100;
+const uint32_t kPhotoStoreReaderCount = 5;
 const size_t kStillJpegCapacity = 2 * 1024 * 1024;
-
-struct MemorySnapshot {
-  size_t heap_free;
-  size_t heap_largest;
-  size_t psram_free;
-  size_t psram_largest;
-};
 
 static MemorySnapshot captureMemorySnapshot() {
   return {
@@ -645,6 +667,16 @@ void setup() {
     Serial.println("Phase 4 gate failed: 1080p capture and baseline restoration");
     return;
   }
+  if (!runPhotoStoreValidation(kPhotoStoreReplacementCycles,
+                               kPhotoStoreReaderCount)) {
+    Serial.println("Phase 5 gate failed: photo store ownership validation");
+    return;
+  }
+  if (!photo_api.begin(&photo_store, capturePhotoForApi)) {
+    Serial.println("Phase 6 gate failed: HTTP photo API startup");
+    return;
+  }
+  Serial.println("HTTP photo API ready: port=80 routes=/api/photo/*");
   Serial.printf("JPEG baseline quality=%lu interval_ms=%lu target_fps=%lu\n",
                 static_cast<unsigned long>(kJpegQuality),
                 static_cast<unsigned long>(kJpegIntervalMs),
@@ -660,6 +692,16 @@ void setup() {
 }
 
 void loop() {
+  if (Serial.available() > 0) {
+    const int command = Serial.read();
+    if (command == 'u' || command == 'U') {
+      photo_api.setUnavailableForTest();
+      Serial.println("photo API test state=unavailable");
+    } else if (command == 'r' || command == 'R') {
+      photo_api.restoreReadyForTest();
+      Serial.println("photo API test state=ready");
+    }
+  }
 #ifndef EXCLUDE_WIFI
   if (!firmware_ready) {
     delay(1000);

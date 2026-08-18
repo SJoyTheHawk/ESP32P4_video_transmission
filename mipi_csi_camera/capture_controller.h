@@ -17,8 +17,27 @@ enum class CaptureControllerState : uint8_t {
   Unavailable,
 };
 
+struct HighResStillCandidate {
+  DetachedJpegOutputBuffer jpeg;
+  uint32_t size = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t quality = 0;
+  uint64_t captured_ms = 0;
+
+  void release() {
+    JpegOutputBuffer::releaseDetached(jpeg);
+    jpeg = {};
+    size = 0;
+  }
+  bool valid() const { return jpeg.data != nullptr && size > 0; }
+};
+
 class CaptureController {
 public:
+  CaptureController();
+  ~CaptureController();
+
   class BaselineFrame {
   public:
     BaselineFrame() = default;
@@ -38,7 +57,8 @@ public:
   private:
     friend class CaptureController;
     BaselineFrame(CaptureController *owner, uint8_t *data, size_t size,
-                  uint32_t width, uint32_t height, uint32_t index);
+                  uint32_t width, uint32_t height, uint32_t index,
+                  bool operation_locked);
 
     CaptureController *owner_ = nullptr;
     uint8_t *data_ = nullptr;
@@ -46,6 +66,7 @@ public:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t index_ = 0;
+    bool operation_locked_ = false;
   };
 
   bool beginBaseline(const char *device_path, size_t buffer_count,
@@ -57,6 +78,7 @@ public:
   bool runTimeoutRecoveryTest();
   bool runRestartValidation(uint32_t cycles);
   bool run1080pCaptureValidation(uint32_t cycles);
+  bool capture1080pStill(HighResStillCandidate *candidate);
 
   bool isBaselineRunning() const;
   CaptureControllerState state() const;
@@ -104,4 +126,5 @@ private:
   bool stream_started_ = false;
   CaptureControllerState state_ = CaptureControllerState::Uninitialized;
   JpegEncoderClass jpeg_encoder_;
+  SemaphoreHandle_t operation_mutex_ = nullptr;
 };

@@ -37,6 +37,10 @@ DetachedJpegOutputBuffer JpegOutputBuffer::detach() {
   return detached;
 }
 
+void JpegOutputBuffer::releaseDetached(DetachedJpegOutputBuffer detached) {
+  free(detached.data);
+}
+
 uint8_t *JpegOutputBuffer::data() const {
   return data_;
 }
