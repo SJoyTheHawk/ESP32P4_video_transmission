@@ -83,7 +83,7 @@ static bool capturePhotoForApi(void *) {
 
 // Keep this identifier stable within a phase so serial logs can be matched to
 // the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase6-arduino";
+static constexpr char kImplementationVersion[] = "v3.0-phase7-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
