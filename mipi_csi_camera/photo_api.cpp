@@ -81,9 +81,44 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
     .handler = captureHandler,
     .user_ctx = this,
   };
+  const httpd_uri_t resolution_get_uri = {
+    .uri = "/api/stream/resolution",
+    .method = HTTP_GET,
+    .handler = streamResolutionGetHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t resolution_put_uri = {
+    .uri = "/api/stream/resolution",
+    .method = HTTP_PUT,
+    .handler = streamResolutionPutHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t settings_get_uri = {
+    .uri = "/api/settings",
+    .method = HTTP_GET,
+    .handler = settingsGetHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t settings_put_uri = {
+    .uri = "/api/settings",
+    .method = HTTP_PUT,
+    .handler = settingsPutHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t settings_reset_uri = {
+    .uri = "/api/settings/reset",
+    .method = HTTP_POST,
+    .handler = settingsResetHandler,
+    .user_ctx = this,
+  };
   if (httpd_register_uri_handler(server_, &metadata_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &latest_uri) != ESP_OK
-      || httpd_register_uri_handler(server_, &capture_uri) != ESP_OK) {
+      || httpd_register_uri_handler(server_, &capture_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &resolution_get_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &resolution_put_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &settings_get_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &settings_put_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &settings_reset_uri) != ESP_OK) {
     httpd_stop(server_);
     server_ = nullptr;
     vSemaphoreDelete(capture_queue_);
@@ -167,6 +202,119 @@ const char *PhotoApi::stateName() const {
 }
 
 bool PhotoApi::running() const { return server_ != nullptr; }
+
+void PhotoApi::setCaptureController(CaptureController *controller) {
+  controller_ = controller;
+}
+
+esp_err_t PhotoApi::streamResolutionGetHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleStreamResolutionGet(request);
+}
+
+esp_err_t PhotoApi::streamResolutionPutHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleStreamResolutionPut(request);
+}
+
+esp_err_t PhotoApi::handleStreamResolutionGet(httpd_req_t *request) {
+  if (controller_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                        "Controller not available");
+  }
+
+  StreamResolution current = controller_->getCurrentResolution();
+  const char *current_name = controller_->resolutionName(current);
+  uint32_t width = controller_->width();
+  uint32_t height = controller_->height();
+
+  char response[256];
+  snprintf(response, sizeof(response),
+           "{\"current\":\"%s\",\"width\":%u,\"height\":%u,"
+           "\"supported\":[\"xvga\",\"wvga\",\"portrait\"]}",
+           (current == StreamResolution::XVGA_800x800) ? "xvga" :
+           (current == StreamResolution::WVGA_800x640) ? "wvga" : "portrait",
+           width, height);
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
+
+esp_err_t PhotoApi::handleStreamResolutionPut(httpd_req_t *request) {
+  if (controller_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                        "Controller not available");
+  }
+
+  if (!controller_->isBaselineRunning()) {
+    return sendHttpError(request, "503 Service Unavailable",
+                        "Controller not in baseline state");
+  }
+
+  char body[64] = {};
+  const int content_len = request->content_len;
+  if (content_len <= 0 || content_len >= static_cast<int>(sizeof(body))) {
+    return sendHttpError(request, "400 Bad Request", "Invalid content length");
+  }
+
+  const int received = httpd_req_recv(request, body, content_len);
+  if (received != content_len) {
+    return sendHttpError(request, "400 Bad Request", "Failed to read body");
+  }
+  body[content_len] = '\0';
+
+  // Simple JSON parsing for {"resolution":"xvga"} or {"resolution":"wvga"}
+  const char *resolution_key = strstr(body, "\"resolution\"");
+  if (resolution_key == nullptr) {
+    return sendHttpError(request, "400 Bad Request",
+                        "Missing resolution field");
+  }
+
+  const char *value_start = strchr(resolution_key, ':');
+  if (value_start == nullptr) {
+    return sendHttpError(request, "400 Bad Request", "Invalid JSON format");
+  }
+  value_start++;
+  while (*value_start == ' ' || *value_start == '\"') value_start++;
+
+  StreamResolution target;
+  bool valid = false;
+
+  if (strncmp(value_start, "xvga", 4) == 0) {
+    target = StreamResolution::XVGA_800x800;
+    valid = true;
+  } else if (strncmp(value_start, "wvga", 4) == 0) {
+    target = StreamResolution::WVGA_800x640;
+    valid = true;
+  } else if (strncmp(value_start, "portrait", 8) == 0) {
+    target = StreamResolution::Portrait_800x1280;
+    valid = true;
+  }
+
+  if (!valid) {
+    return sendHttpError(request, "400 Bad Request",
+                        "Invalid resolution (use 'xvga', 'wvga', or 'portrait')");
+  }
+
+  StreamResolution previous = controller_->getCurrentResolution();
+  if (!controller_->switchResolution(target)) {
+    return sendHttpError(request, "500 Internal Server Error",
+                        "Resolution switch failed");
+  }
+
+  char response[256];
+  snprintf(response, sizeof(response),
+           "{\"status\":\"success\",\"resolution\":\"%s\","
+           "\"width\":%u,\"height\":%u,\"previous\":\"%s\"}",
+           (target == StreamResolution::XVGA_800x800) ? "xvga" :
+           (target == StreamResolution::WVGA_800x640) ? "wvga" : "portrait",
+           controller_->width(), controller_->height(),
+           (previous == StreamResolution::XVGA_800x800) ? "xvga" :
+           (previous == StreamResolution::WVGA_800x640) ? "wvga" : "portrait");
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
 
 esp_err_t PhotoApi::metadataHandler(httpd_req_t *request) {
   PhotoApi *api = apiFromRequest(request);
@@ -343,3 +491,183 @@ void PhotoApi::runCaptureWorker() {
 void PhotoApi::setState(PhotoApiState state) {
   state_.store(state, std::memory_order_release);
 }
+
+void PhotoApi::setSettingsManager(SettingsManager *manager,
+                                   CameraSettings *settings) {
+  settings_manager_ = manager;
+  settings_ = settings;
+}
+
+esp_err_t PhotoApi::settingsGetHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "no context")
+                        : api->handleSettingsGet(request);
+}
+
+esp_err_t PhotoApi::settingsPutHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "no context")
+                        : api->handleSettingsPut(request);
+}
+
+esp_err_t PhotoApi::settingsResetHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "no context")
+                        : api->handleSettingsReset(request);
+}
+
+esp_err_t PhotoApi::handleSettingsGet(httpd_req_t *request) {
+  if (settings_manager_ == nullptr || settings_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                         "settings not available");
+  }
+
+  if (controller_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                         "controller not available");
+  }
+
+  const char *resolution_name = controller_->resolutionName(
+      settings_->stream_resolution);
+
+  char response[256];
+  snprintf(response, sizeof(response),
+           "{\"stream_resolution\":\"%s\","
+           "\"jpeg_quality\":%u,"
+           "\"auto_start_stream\":%s,"
+           "\"background_capture\":{"
+           "\"enabled\":%s,"
+           "\"interval_seconds\":%lu}}",
+           resolution_name,
+           settings_->jpeg_quality,
+           settings_->auto_start_stream ? "true" : "false",
+           settings_->enable_background_capture ? "true" : "false",
+           static_cast<unsigned long>(settings_->capture_interval_seconds));
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
+
+esp_err_t PhotoApi::handleSettingsPut(httpd_req_t *request) {
+  if (settings_manager_ == nullptr || settings_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                         "settings not available");
+  }
+
+  if (controller_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                         "controller not available");
+  }
+
+  char body[512];
+  const size_t body_len = request->content_len;
+  if (body_len == 0 || body_len >= sizeof(body)) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                               "body required");
+  }
+
+  int received = httpd_req_recv(request, body, sizeof(body) - 1);
+  if (received <= 0) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                               "failed to read body");
+  }
+  body[received] = '\0';
+
+  // Parse resolution change
+  const char *res_key = "\"stream_resolution\":\"";
+  const char *res_start = strstr(body, res_key);
+  bool resolution_changed = false;
+  StreamResolution new_resolution = settings_->stream_resolution;
+
+  if (res_start != nullptr) {
+    res_start += strlen(res_key);
+    if (strncmp(res_start, "xvga\"", 5) == 0) {
+      new_resolution = StreamResolution::XVGA_800x800;
+      resolution_changed = true;
+    } else if (strncmp(res_start, "wvga\"", 5) == 0) {
+      new_resolution = StreamResolution::WVGA_800x640;
+      resolution_changed = true;
+    } else if (strncmp(res_start, "portrait\"", 9) == 0) {
+      new_resolution = StreamResolution::Portrait_800x1280;
+      resolution_changed = true;
+    } else {
+      return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                 "invalid resolution");
+    }
+  }
+
+  // Parse quality change
+  const char *quality_key = "\"jpeg_quality\":";
+  const char *quality_start = strstr(body, quality_key);
+  bool quality_changed = false;
+  uint8_t new_quality = settings_->jpeg_quality;
+
+  if (quality_start != nullptr) {
+    quality_start += strlen(quality_key);
+    char *end = nullptr;
+    long parsed = strtol(quality_start, &end, 10);
+    if (parsed >= 10 && parsed <= 100) {
+      new_quality = static_cast<uint8_t>(parsed);
+      quality_changed = true;
+    } else {
+      return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                 "jpeg_quality must be 10-100");
+    }
+  }
+
+  // Apply resolution change if requested
+  if (resolution_changed && new_resolution != settings_->stream_resolution) {
+    if (!controller_->switchResolution(new_resolution)) {
+      return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                 "resolution switch failed");
+    }
+    settings_->stream_resolution = new_resolution;
+  }
+
+  // Apply quality change if requested
+  if (quality_changed) {
+    settings_->jpeg_quality = new_quality;
+    // Note: JPEG quality change would require controller method
+  }
+
+  // Save to NVS
+  if (!settings_manager_->saveSettings(*settings_)) {
+    return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "failed to save settings");
+  }
+
+  // Build response
+  char response[256];
+  snprintf(response, sizeof(response),
+           "{\"status\":\"success\","
+           "\"applied\":{"
+           "\"stream_resolution\":\"%s\","
+           "\"jpeg_quality\":%u},"
+           "\"requires_reboot\":false}",
+           controller_->resolutionName(settings_->stream_resolution),
+           settings_->jpeg_quality);
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
+
+esp_err_t PhotoApi::handleSettingsReset(httpd_req_t *request) {
+  if (settings_manager_ == nullptr || settings_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable",
+                         "settings not available");
+  }
+
+  if (!settings_manager_->resetToDefaults()) {
+    return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "failed to reset settings");
+  }
+
+  // Reload defaults
+  settings_->setDefaults();
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request,
+                            "{\"status\":\"success\","
+                            "\"message\":\"settings reset to defaults\"}");
+}
+

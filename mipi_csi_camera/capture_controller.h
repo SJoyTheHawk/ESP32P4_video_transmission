@@ -17,6 +17,12 @@ enum class CaptureControllerState : uint8_t {
   Unavailable,
 };
 
+enum class StreamResolution : uint8_t {
+  XVGA_800x800,
+  WVGA_800x640,
+  Portrait_800x1280,
+};
+
 struct HighResStillCandidate {
   DetachedJpegOutputBuffer jpeg;
   uint32_t size = 0;
@@ -80,6 +86,11 @@ public:
   bool run1080pCaptureValidation(uint32_t cycles);
   bool capture1080pStill(HighResStillCandidate *candidate);
 
+  bool switchResolution(StreamResolution target);
+  StreamResolution getCurrentResolution() const;
+  bool isResolutionSupported(StreamResolution resolution) const;
+  const char *resolutionName(StreamResolution resolution) const;
+
   bool isBaselineRunning() const;
   CaptureControllerState state() const;
   const char *stateName() const;
@@ -110,6 +121,9 @@ private:
   bool releaseBuffer(uint32_t index);
   bool probeVgaOutputFormat(const struct v4l2_format &original_format);
   void setState(CaptureControllerState state);
+  const esp_cam_sensor_format_t* getSensorFormatForResolution(
+    StreamResolution resolution) const;
+  bool memoryGateForResolution(StreamResolution resolution) const;
 
   int fd_ = -1;
   const char *device_path_ = nullptr;
@@ -125,6 +139,7 @@ private:
   bool baseline_sensor_format_saved_ = false;
   bool stream_started_ = false;
   CaptureControllerState state_ = CaptureControllerState::Uninitialized;
+  StreamResolution current_resolution_ = StreamResolution::XVGA_800x800;
   JpegEncoderClass jpeg_encoder_;
   SemaphoreHandle_t operation_mutex_ = nullptr;
 };

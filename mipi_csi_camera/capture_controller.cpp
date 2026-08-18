@@ -1,5 +1,8 @@
 #include "capture_controller.h"
 #include "ov5647_1080p_mode.h"
+#include "ov5647_800x800_mode.h"
+#include "ov5647_800x640_mode.h"
+#include "ov5647_800x1280_mode.h"
 
 #include <errno.h>
 #include <esp_heap_caps.h>
@@ -777,3 +780,216 @@ const char *CaptureController::stateName() const {
 uint32_t CaptureController::width() const { return width_; }
 uint32_t CaptureController::height() const { return height_; }
 const char *CaptureController::formatName() const { return "RGB565"; }
+
+bool CaptureController::switchResolution(StreamResolution target) {
+  if (xSemaphoreTake(operation_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.printf("resolution switch: blocked by operation lock\n");
+    return false;
+  }
+
+  if (state_ != CaptureControllerState::BaselineRunning) {
+    Serial.printf("resolution switch: invalid state=%s\n", stateName());
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  if (target == current_resolution_) {
+    Serial.printf("resolution switch: already at target=%s\n", resolutionName(target));
+    xSemaphoreGive(operation_mutex_);
+    return true;
+  }
+
+  const esp_cam_sensor_format_t* target_format = getSensorFormatForResolution(target);
+  if (target_format == nullptr) {
+    Serial.printf("resolution switch: unsupported target=%d\n", static_cast<int>(target));
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  if (!memoryGateForResolution(target)) {
+    Serial.printf("resolution switch: insufficient memory for target=%s\n",
+                  resolutionName(target));
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Save current state for rollback
+  StreamResolution previous_resolution = current_resolution_;
+  esp_cam_sensor_format_t previous_format = baseline_sensor_format_;
+  uint32_t previous_width = width_;
+  uint32_t previous_height = height_;
+
+  Serial.printf("resolution switch: from=%s (%ux%u) to=%s (%ux%u)\n",
+                resolutionName(previous_resolution), previous_width, previous_height,
+                resolutionName(target), target_format->width, target_format->height);
+
+  // Stop current stream
+  stopStream();
+  releaseBuffers();
+  jpeg_encoder_.end();
+
+  // Apply new sensor format
+  setState(CaptureControllerState::SensorConfiguring);
+  errno = 0;
+  if (ioctl(fd_, VIDIOC_S_SENSOR_FMT, target_format) != 0) {
+    Serial.printf("resolution switch: sensor format failed errno=%d\n", errno);
+    // Rollback
+    ioctl(fd_, VIDIOC_S_SENSOR_FMT, &previous_format);
+    setRgb565Output();
+    width_ = previous_width;
+    height_ = previous_height;
+    baseline_sensor_format_ = previous_format;
+    requestAndMapBuffers(requested_buffer_count_);
+    jpeg_encoder_.begin(width_, height_, jpeg_quality_);
+    startStream();
+    setState(CaptureControllerState::BaselineRunning);
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Set RGB565 output
+  if (!setRgb565Output()) {
+    Serial.printf("resolution switch: RGB565 format failed\n");
+    // Rollback
+    ioctl(fd_, VIDIOC_S_SENSOR_FMT, &previous_format);
+    setRgb565Output();
+    width_ = previous_width;
+    height_ = previous_height;
+    baseline_sensor_format_ = previous_format;
+    requestAndMapBuffers(requested_buffer_count_);
+    jpeg_encoder_.begin(width_, height_, jpeg_quality_);
+    startStream();
+    setState(CaptureControllerState::BaselineRunning);
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Update dimensions
+  width_ = target_format->width;
+  height_ = target_format->height;
+  baseline_sensor_format_ = *target_format;
+
+  // Allocate new buffers
+  if (!requestAndMapBuffers(requested_buffer_count_)) {
+    Serial.printf("resolution switch: buffer allocation failed\n");
+    // Rollback
+    ioctl(fd_, VIDIOC_S_SENSOR_FMT, &previous_format);
+    setRgb565Output();
+    width_ = previous_width;
+    height_ = previous_height;
+    baseline_sensor_format_ = previous_format;
+    requestAndMapBuffers(requested_buffer_count_);
+    jpeg_encoder_.begin(previous_width, previous_height, jpeg_quality_);
+    startStream();
+    setState(CaptureControllerState::BaselineRunning);
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Reinitialize JPEG encoder for new dimensions
+  if (!jpeg_encoder_.begin(width_, height_, jpeg_quality_)) {
+    Serial.printf("resolution switch: JPEG encoder init failed\n");
+    // Rollback
+    releaseBuffers();
+    ioctl(fd_, VIDIOC_S_SENSOR_FMT, &previous_format);
+    setRgb565Output();
+    width_ = previous_width;
+    height_ = previous_height;
+    baseline_sensor_format_ = previous_format;
+    requestAndMapBuffers(requested_buffer_count_);
+    jpeg_encoder_.begin(previous_width, previous_height, jpeg_quality_);
+    startStream();
+    setState(CaptureControllerState::BaselineRunning);
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Start new stream
+  if (!startStream()) {
+    Serial.printf("resolution switch: stream start failed\n");
+    // Rollback
+    jpeg_encoder_.end();
+    releaseBuffers();
+    ioctl(fd_, VIDIOC_S_SENSOR_FMT, &previous_format);
+    setRgb565Output();
+    width_ = previous_width;
+    height_ = previous_height;
+    baseline_sensor_format_ = previous_format;
+    requestAndMapBuffers(requested_buffer_count_);
+    jpeg_encoder_.begin(previous_width, previous_height, jpeg_quality_);
+    startStream();
+    setState(CaptureControllerState::BaselineRunning);
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
+  // Discard settling frames
+  discardSettlingFrames(kBaselineSettlingFrames);
+
+  // Success
+  current_resolution_ = target;
+  setState(CaptureControllerState::BaselineRunning);
+
+  Serial.printf("resolution switch: success new_resolution=%s (%ux%u)\n",
+                resolutionName(current_resolution_), width_, height_);
+
+  xSemaphoreGive(operation_mutex_);
+  return true;
+}
+
+StreamResolution CaptureController::getCurrentResolution() const {
+  return current_resolution_;
+}
+
+bool CaptureController::isResolutionSupported(StreamResolution resolution) const {
+  return getSensorFormatForResolution(resolution) != nullptr;
+}
+
+const char *CaptureController::resolutionName(StreamResolution resolution) const {
+  switch (resolution) {
+    case StreamResolution::XVGA_800x800: return "XVGA";
+    case StreamResolution::WVGA_800x640: return "WVGA";
+    case StreamResolution::Portrait_800x1280: return "Portrait";
+    default: return "UNKNOWN";
+  }
+}
+
+const esp_cam_sensor_format_t* CaptureController::getSensorFormatForResolution(
+    StreamResolution resolution) const {
+  switch (resolution) {
+    case StreamResolution::XVGA_800x800:
+      return &ov5647_800x800_sensor_format();
+    case StreamResolution::WVGA_800x640:
+      return &ov5647_800x640_sensor_format();
+    case StreamResolution::Portrait_800x1280:
+      return &ov5647_800x1280_sensor_format();
+    default:
+      return nullptr;
+  }
+}
+
+bool CaptureController::memoryGateForResolution(StreamResolution resolution) const {
+  const esp_cam_sensor_format_t* format = getSensorFormatForResolution(resolution);
+  if (format == nullptr) {
+    return false;
+  }
+
+  const size_t buffer_bytes = static_cast<size_t>(format->width) * format->height * 2;
+  const size_t total_buffers = buffer_bytes * requested_buffer_count_;
+  const size_t jpeg_encoder_estimate = 300 * 1024;
+  const size_t reserve = 512 * 1024;
+  const size_t required = total_buffers + jpeg_encoder_estimate + reserve;
+
+  const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+  const bool fits = psram_free >= required && psram_largest >= buffer_bytes;
+
+  if (!fits) {
+    Serial.printf(
+      "resolution gate: failed resolution=%s required=%u psram_free=%u psram_largest=%u\n",
+      resolutionName(resolution), required, psram_free, psram_largest);
+  }
+
+  return fits;
+}

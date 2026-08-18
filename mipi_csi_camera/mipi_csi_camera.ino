@@ -15,6 +15,7 @@
 #include "jpeg_output_buffer.h"
 #include "photo_store.h"
 #include "photo_api.h"
+#include "settings_manager.h"
 
 #ifndef EXCLUDE_WIFI
 #include <WiFi.h>
@@ -64,6 +65,8 @@ ESPVideoClass video;
 CaptureController capture_controller;
 PhotoStore photo_store;
 PhotoApi photo_api;
+SettingsManager settings_manager;
+CameraSettings settings;
 
 static bool capturePhotoForApi(void *) {
   HighResStillCandidate candidate;
@@ -83,7 +86,7 @@ static bool capturePhotoForApi(void *) {
 
 // Keep this identifier stable within a phase so serial logs can be matched to
 // the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase7-arduino";
+static constexpr char kImplementationVersion[] = "v3.0-phase8-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
@@ -676,12 +679,42 @@ void setup() {
     Serial.println("Phase 6 gate failed: HTTP photo API startup");
     return;
   }
-  Serial.println("HTTP photo API ready: port=80 routes=/api/photo/*");
+  photo_api.setCaptureController(&capture_controller);
+  Serial.println("HTTP photo API ready: port=80 routes=/api/photo/*,/api/stream/*");
   Serial.printf("JPEG baseline quality=%lu interval_ms=%lu target_fps=%lu\n",
                 static_cast<unsigned long>(kJpegQuality),
                 static_cast<unsigned long>(kJpegIntervalMs),
                 static_cast<unsigned long>(1000 / kJpegIntervalMs));
   logMemoryBaseline("jpeg-encoder-ready");
+
+  // Phase 8: Load and apply saved settings
+  if (!settings_manager.begin()) {
+    Serial.println("settings_manager: failed to initialize, using defaults");
+    settings.setDefaults();
+  } else if (!settings_manager.loadSettings(settings)) {
+    Serial.println("settings: no saved settings found, using defaults");
+    settings.setDefaults();
+    settings_manager.saveSettings(settings);
+  } else {
+    Serial.printf("settings: loaded from NVS resolution=%s quality=%u\n",
+                  capture_controller.resolutionName(settings.stream_resolution),
+                  settings.jpeg_quality);
+
+    // Apply saved resolution if different from default
+    if (settings.stream_resolution != StreamResolution::XVGA_800x800) {
+      if (capture_controller.switchResolution(settings.stream_resolution)) {
+        Serial.printf("settings: restored resolution to %s (%ux%u)\n",
+                      capture_controller.resolutionName(settings.stream_resolution),
+                      capture_controller.width(),
+                      capture_controller.height());
+      } else {
+        Serial.println("settings: failed to restore resolution, staying at default");
+        settings.stream_resolution = StreamResolution::XVGA_800x800;
+        settings_manager.saveSettings(settings);
+      }
+    }
+  }
+  photo_api.setSettingsManager(&settings_manager, &settings);
 
 #ifndef EXCLUDE_WIFI
   rtsp_server_ready = startRtspServer();
@@ -700,6 +733,36 @@ void loop() {
     } else if (command == 'r' || command == 'R') {
       photo_api.restoreReadyForTest();
       Serial.println("photo API test state=ready");
+    } else if (command == 'w' || command == 'W') {
+      Serial.println("Switching to WVGA (800x640)...");
+      if (capture_controller.switchResolution(StreamResolution::WVGA_800x640)) {
+        Serial.printf("Resolution switch success: now running at %ux%u\n",
+                     capture_controller.width(), capture_controller.height());
+      } else {
+        Serial.println("Resolution switch failed");
+      }
+    } else if (command == 'x' || command == 'X') {
+      Serial.println("Switching to XVGA (800x800)...");
+      if (capture_controller.switchResolution(StreamResolution::XVGA_800x800)) {
+        Serial.printf("Resolution switch success: now running at %ux%u\n",
+                     capture_controller.width(), capture_controller.height());
+      } else {
+        Serial.println("Resolution switch failed");
+      }
+    } else if (command == 'q' || command == 'Q') {
+      Serial.printf("Current resolution: %s (%ux%u)\n",
+                   capture_controller.resolutionName(
+                     capture_controller.getCurrentResolution()),
+                   capture_controller.width(),
+                   capture_controller.height());
+    } else if (command == 'p' || command == 'P') {
+      Serial.println("Switching to Portrait (800x1280)...");
+      if (capture_controller.switchResolution(StreamResolution::Portrait_800x1280)) {
+        Serial.printf("Resolution switch success: now running at %ux%u\n",
+                     capture_controller.width(), capture_controller.height());
+      } else {
+        Serial.println("Resolution switch failed");
+      }
     }
   }
 #ifndef EXCLUDE_WIFI
