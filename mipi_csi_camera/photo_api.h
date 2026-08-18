@@ -36,6 +36,7 @@ public:
   void setSettingsManager(SettingsManager *manager, CameraSettings *settings);
 
 private:
+  static esp_err_t rootHandler(httpd_req_t *request);
   static esp_err_t metadataHandler(httpd_req_t *request);
   static esp_err_t latestHandler(httpd_req_t *request);
   static esp_err_t captureHandler(httpd_req_t *request);
@@ -46,6 +47,7 @@ private:
   static esp_err_t settingsResetHandler(httpd_req_t *request);
   static void captureWorker(void *argument);
 
+  esp_err_t handleRoot(httpd_req_t *request);
   esp_err_t handleMetadata(httpd_req_t *request);
   esp_err_t handleLatest(httpd_req_t *request);
   esp_err_t handleCapture(httpd_req_t *request);

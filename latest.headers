@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Transfer-Encoding: chunked
+Cache-Control: no-cache
+ETag: "photo-1"
+

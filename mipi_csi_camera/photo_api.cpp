@@ -1,4 +1,5 @@
 #include "photo_api.h"
+#include "web_ui.h"
 
 #include <cerrno>
 #include <cctype>
@@ -54,7 +55,7 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
-  config.max_uri_handlers = 8;
+  config.max_uri_handlers = 10;
   config.lru_purge_enable = true;
   if (httpd_start(&server_, &config) != ESP_OK) {
     vSemaphoreDelete(capture_queue_);
@@ -63,6 +64,12 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
     return false;
   }
 
+  const httpd_uri_t root_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = rootHandler,
+    .user_ctx = this,
+  };
   const httpd_uri_t metadata_uri = {
     .uri = "/api/photo/metadata",
     .method = HTTP_GET,
@@ -111,7 +118,8 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
     .handler = settingsResetHandler,
     .user_ctx = this,
   };
-  if (httpd_register_uri_handler(server_, &metadata_uri) != ESP_OK
+  if (httpd_register_uri_handler(server_, &root_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &metadata_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &latest_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &capture_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &resolution_get_uri) != ESP_OK
@@ -207,6 +215,16 @@ void PhotoApi::setCaptureController(CaptureController *controller) {
   controller_ = controller;
 }
 
+esp_err_t PhotoApi::rootHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleRoot(request);
+}
+
+esp_err_t PhotoApi::handleRoot(httpd_req_t *request) {
+  httpd_resp_set_type(request, "text/html");
+  return httpd_resp_sendstr(request, WebUI::getSettingsPage());
+}
+
 esp_err_t PhotoApi::streamResolutionGetHandler(httpd_req_t *request) {
   PhotoApi *api = apiFromRequest(request);
   return api == nullptr ? ESP_FAIL : api->handleStreamResolutionGet(request);
@@ -230,10 +248,11 @@ esp_err_t PhotoApi::handleStreamResolutionGet(httpd_req_t *request) {
 
   char response[256];
   snprintf(response, sizeof(response),
-           "{\"current\":\"%s\",\"width\":%u,\"height\":%u,"
+           "{\"current\":\"%s\",\"resolution_name\":\"%s\",\"width\":%u,\"height\":%u,"
            "\"supported\":[\"xvga\",\"wvga\",\"portrait\"]}",
            (current == StreamResolution::XVGA_800x800) ? "xvga" :
            (current == StreamResolution::WVGA_800x640) ? "wvga" : "portrait",
+           current_name,
            width, height);
 
   httpd_resp_set_type(request, "application/json");
@@ -527,18 +546,32 @@ esp_err_t PhotoApi::handleSettingsGet(httpd_req_t *request) {
                          "controller not available");
   }
 
-  const char *resolution_name = controller_->resolutionName(
-      settings_->stream_resolution);
+  // Convert StreamResolution enum to index for web UI
+  int resolution_index;
+  switch (settings_->stream_resolution) {
+    case StreamResolution::WVGA_800x640:
+      resolution_index = 0;
+      break;
+    case StreamResolution::XVGA_800x800:
+      resolution_index = 1;
+      break;
+    case StreamResolution::Portrait_800x1280:
+      resolution_index = 2;
+      break;
+    default:
+      resolution_index = 1;  // Default to XVGA
+      break;
+  }
 
   char response[256];
   snprintf(response, sizeof(response),
-           "{\"stream_resolution\":\"%s\","
+           "{\"stream_resolution\":%d,"
            "\"jpeg_quality\":%u,"
            "\"auto_start_stream\":%s,"
            "\"background_capture\":{"
            "\"enabled\":%s,"
            "\"interval_seconds\":%lu}}",
-           resolution_name,
+           resolution_index,
            settings_->jpeg_quality,
            settings_->auto_start_stream ? "true" : "false",
            settings_->enable_background_capture ? "true" : "false",
@@ -573,26 +606,54 @@ esp_err_t PhotoApi::handleSettingsPut(httpd_req_t *request) {
   }
   body[received] = '\0';
 
-  // Parse resolution change
-  const char *res_key = "\"stream_resolution\":\"";
-  const char *res_start = strstr(body, res_key);
+  // Parse resolution change (accepts both index and string format)
   bool resolution_changed = false;
   StreamResolution new_resolution = settings_->stream_resolution;
 
-  if (res_start != nullptr) {
-    res_start += strlen(res_key);
-    if (strncmp(res_start, "xvga\"", 5) == 0) {
-      new_resolution = StreamResolution::XVGA_800x800;
-      resolution_changed = true;
-    } else if (strncmp(res_start, "wvga\"", 5) == 0) {
-      new_resolution = StreamResolution::WVGA_800x640;
-      resolution_changed = true;
-    } else if (strncmp(res_start, "portrait\"", 9) == 0) {
-      new_resolution = StreamResolution::Portrait_800x1280;
-      resolution_changed = true;
-    } else {
-      return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
-                                 "invalid resolution");
+  // Try integer index format first: "stream_resolution":0
+  const char *res_num_key = "\"stream_resolution\":";
+  const char *res_num_start = strstr(body, res_num_key);
+  if (res_num_start != nullptr) {
+    res_num_start += strlen(res_num_key);
+    char *end = nullptr;
+    long index = strtol(res_num_start, &end, 10);
+    if (index >= 0 && index <= 2) {
+      switch (index) {
+        case 0:
+          new_resolution = StreamResolution::WVGA_800x640;
+          resolution_changed = true;
+          break;
+        case 1:
+          new_resolution = StreamResolution::XVGA_800x800;
+          resolution_changed = true;
+          break;
+        case 2:
+          new_resolution = StreamResolution::Portrait_800x1280;
+          resolution_changed = true;
+          break;
+      }
+    }
+  }
+
+  // Try string format: "stream_resolution":"xvga"
+  if (!resolution_changed) {
+    const char *res_key = "\"stream_resolution\":\"";
+    const char *res_start = strstr(body, res_key);
+    if (res_start != nullptr) {
+      res_start += strlen(res_key);
+      if (strncmp(res_start, "xvga\"", 5) == 0) {
+        new_resolution = StreamResolution::XVGA_800x800;
+        resolution_changed = true;
+      } else if (strncmp(res_start, "wvga\"", 5) == 0) {
+        new_resolution = StreamResolution::WVGA_800x640;
+        resolution_changed = true;
+      } else if (strncmp(res_start, "portrait\"", 9) == 0) {
+        new_resolution = StreamResolution::Portrait_800x1280;
+        resolution_changed = true;
+      } else {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                   "invalid resolution");
+      }
     }
   }
 
