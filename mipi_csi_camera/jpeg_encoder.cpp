@@ -1,6 +1,12 @@
 #include "jpeg_encoder.h"
 
+JpegEncoderClass::~JpegEncoderClass() {
+  end();
+}
+
 bool JpegEncoderClass::begin(uint32_t width, uint32_t height, uint32_t quality) {
+  end();
+
   jpeg_encode_engine_cfg_t engineConfig = {};
   engineConfig.timeout_ms = 40;
   if (jpeg_new_encoder_engine(&engineConfig, &handle_) != ESP_OK) {
@@ -8,13 +14,8 @@ bool JpegEncoderClass::begin(uint32_t width, uint32_t height, uint32_t quality) 
   }
 
   const size_t requestedSize = static_cast<size_t>(width) * height * 2;
-  jpeg_encode_memory_alloc_cfg_t memoryConfig = {};
-  memoryConfig.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
-  output_ = static_cast<uint8_t *>(
-    jpeg_alloc_encoder_mem(requestedSize, &memoryConfig, &output_capacity_));
-  if (output_ == nullptr) {
-    jpeg_del_encoder_engine(handle_);
-    handle_ = nullptr;
+  if (!output_.allocate(requestedSize)) {
+    end();
     return false;
   }
 
@@ -26,15 +27,28 @@ bool JpegEncoderClass::begin(uint32_t width, uint32_t height, uint32_t quality) 
   return true;
 }
 
+void JpegEncoderClass::end() {
+  output_.release();
+  if (handle_ != nullptr) {
+    jpeg_del_encoder_engine(handle_);
+    handle_ = nullptr;
+  }
+  config_ = {};
+}
+
 bool JpegEncoderClass::encode(const uint8_t *rgb565, uint32_t size,
                               JpegEncodeResult *result) {
-  uint32_t encodedSize = 0;
-  if (jpeg_encoder_process(handle_, &config_, rgb565, size, output_,
-                           output_capacity_, &encodedSize) != ESP_OK) {
+  if (handle_ == nullptr || !output_.valid() || result == nullptr) {
     return false;
   }
 
-  result->data = output_;
+  uint32_t encodedSize = 0;
+  if (jpeg_encoder_process(handle_, &config_, rgb565, size, output_.data(),
+                           output_.capacity(), &encodedSize) != ESP_OK) {
+    return false;
+  }
+
+  result->data = output_.data();
   result->size = encodedSize;
   return true;
 }

@@ -18,18 +18,20 @@ Every firmware image must print the identifier during `setup()` using this
 stable log field:
 
 ```text
-implementation version=v3.0-phase1-arduino
+implementation version=v3.0-phase2-arduino
 ```
 
 Use the identifier when naming captured serial logs and test results, for
 example:
 
 ```text
-docs/phase1_arduino_v3.0_serial.log
-docs/phase1_arduino_v3.0_results.md
+docs/phase2_arduino_v3.0_serial.log
+docs/phase2_arduino_v3.0_results.md
 ```
 
 The phase identifier changes whenever implementation behavior crosses a plan
 phase boundary. A rebuild with no behavior change keeps the same identifier;
 the build timestamp and compiler output belong in the result record, not in the
 version string.
+
+The current implementation is `v3.0-phase2-arduino`.

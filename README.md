@@ -64,6 +64,7 @@ the IPv4 `MF` flag or a nonzero fragment offset.
   `docs/OV5647_HIGH_RES_STILL_CAPTURE_IMPLEMENTATION_PLAN_V3.md`
 - High-resolution still execution guide:
   `docs/OV5647_HIGH_RES_STILL_CAPTURE_EXECUTION_GUIDE_V3.md`
+- Phase 2 Arduino acceptance test: `docs/PHASE2_ARDUINO_TEST.md`
 - Vendored library provenance: `mipi_csi_camera/src/rtsp_server/UPSTREAM.md`
 - Historical TCP receiver: `tools/pc_receiver.py`
 
@@ -76,8 +77,9 @@ The firmware prints its implementation identifier at boot as
 | --- | --- | --- |
 | `v3.0-phase0-arduino` | Arduino IDE | Hardware baseline diagnostics |
 | `v3.0-phase1-arduino` | Arduino IDE | Baseline-parity build and flash |
-| `v3.0-phase2-arduino` | Arduino IDE | Timed-dequeue/resource work, if supported by the installed core |
+| `v3.0-phase2-arduino` | Arduino IDE | Bounded dequeue compatibility and JPEG resource lifecycle gates |
 
-The current sketch is `v3.0-phase1-arduino`. V3's later high-resolution phases
+The current sketch is `v3.0-phase2-arduino`. Its board acceptance procedure is
+documented in `docs/PHASE2_ARDUINO_TEST.md`. V3's later high-resolution phases
 must receive a new identifier when their behavior changes; do not reuse a phase
 identifier for a different firmware image.

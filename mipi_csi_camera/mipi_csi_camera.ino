@@ -13,9 +13,11 @@
 #include <esp_heap_caps.h>
 #include <esp_video_ioctl.h>
 #include <fcntl.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include "jpeg_encoder.h"
+#include "jpeg_output_buffer.h"
 
 #ifndef EXCLUDE_WIFI
 #include <WiFi.h>
@@ -60,13 +62,32 @@ JpegEncoderClass jpeg_encoder;
 
 // Keep this identifier stable within a phase so serial logs can be matched to
 // the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase1-arduino";
+static constexpr char kImplementationVersion[] = "v3.0-phase2-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
 const uint32_t kBaselineReportIntervalMs = 5000;
+const uint32_t kCaptureDequeueTimeoutMs = 5000;
+const uint32_t kLifecycleTestCycles = 100;
+const size_t kStillJpegCapacity = 2 * 1024 * 1024;
 const uint32_t kVgaWidth = 640;
 const uint32_t kVgaHeight = 480;
+
+struct MemorySnapshot {
+  size_t heap_free;
+  size_t heap_largest;
+  size_t psram_free;
+  size_t psram_largest;
+};
+
+static MemorySnapshot captureMemorySnapshot() {
+  return {
+    ESP.getFreeHeap(),
+    ESP.getMaxAllocHeap(),
+    ESP.getFreePsram(),
+    heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+  };
+}
 
 static void logMemoryBaseline(const char *milestone) {
   Serial.printf(
@@ -149,10 +170,114 @@ static bool probeVgaOutputFormat(int fd,
   return supported;
 }
 
-static void logCaptureTimeoutBaseline() {
-  Serial.println(
-    "capture timeout status=unsupported dqbuf_wait=portMAX_DELAY "
-    "vfs_select_hooks=no next=vendor-timed-dequeue");
+static bool configureCaptureDequeueTimeout(int fd) {
+  struct timeval requested = {};
+  requested.tv_sec = kCaptureDequeueTimeoutMs / 1000;
+  requested.tv_usec = (kCaptureDequeueTimeoutMs % 1000) * 1000;
+
+  errno = 0;
+  const int set_result = ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &requested);
+  const int set_errno = errno;
+
+  struct timeval actual = {};
+  errno = 0;
+  const int get_result = ioctl(fd, VIDIOC_G_DQBUF_TIMEOUT, &actual);
+  const int get_errno = errno;
+  const uint64_t actual_us = static_cast<uint64_t>(actual.tv_sec) * 1000000
+                             + actual.tv_usec;
+  const uint64_t requested_us =
+    static_cast<uint64_t>(kCaptureDequeueTimeoutMs) * 1000;
+  const bool ready = set_result == 0 && get_result == 0
+                     && actual_us == requested_us;
+
+  Serial.printf(
+    "capture timeout status=%s requested_ms=%lu actual_us=%llu "
+    "set_result=%d set_errno=%d get_result=%d get_errno=%d "
+    "driver_timeout_errno=EPERM app_timeout_errno=ETIMEDOUT\n",
+    ready ? "configured" : "failed",
+    static_cast<unsigned long>(kCaptureDequeueTimeoutMs), actual_us,
+    set_result, set_errno, get_result, get_errno);
+  return ready;
+}
+
+static bool runJpegResourceLifecycleTest() {
+  bool allocation_cycles_ready = true;
+  bool encoder_cycles_ready = true;
+  bool detach_ready = false;
+
+  // Warm up lazy driver allocations before taking the comparison baseline.
+  {
+    JpegOutputBuffer output;
+    allocation_cycles_ready = output.allocate(kStillJpegCapacity);
+  }
+  jpeg_encode_engine_cfg_t engine_config = {};
+  engine_config.timeout_ms = 40;
+  jpeg_encoder_handle_t warmup_handle = nullptr;
+  if (jpeg_new_encoder_engine(&engine_config, &warmup_handle) == ESP_OK) {
+    encoder_cycles_ready = jpeg_del_encoder_engine(warmup_handle) == ESP_OK;
+  } else {
+    encoder_cycles_ready = false;
+  }
+
+  const MemorySnapshot before = captureMemorySnapshot();
+  for (uint32_t cycle = 0;
+       cycle < kLifecycleTestCycles && allocation_cycles_ready; ++cycle) {
+    JpegOutputBuffer output;
+    allocation_cycles_ready = output.allocate(kStillJpegCapacity)
+                              && output.capacity() >= kStillJpegCapacity;
+  }
+
+  for (uint32_t cycle = 0;
+       cycle < kLifecycleTestCycles && encoder_cycles_ready; ++cycle) {
+    jpeg_encoder_handle_t handle = nullptr;
+    encoder_cycles_ready =
+      jpeg_new_encoder_engine(&engine_config, &handle) == ESP_OK;
+    if (encoder_cycles_ready) {
+      encoder_cycles_ready = jpeg_del_encoder_engine(handle) == ESP_OK;
+    }
+  }
+
+  {
+    JpegOutputBuffer output;
+    if (output.allocate(4096)) {
+      DetachedJpegOutputBuffer detached = output.detach();
+      detach_ready = !output.valid() && output.capacity() == 0
+                     && detached.data != nullptr && detached.capacity >= 4096;
+      free(detached.data);
+      output.release();
+    }
+  }
+
+  const MemorySnapshot after = captureMemorySnapshot();
+  const bool memory_ready = after.heap_free >= before.heap_free
+                            && after.heap_largest >= before.heap_largest
+                            && after.psram_free >= before.psram_free
+                            && after.psram_largest >= before.psram_largest;
+  const bool ready = allocation_cycles_ready && encoder_cycles_ready
+                     && detach_ready && memory_ready;
+
+  Serial.printf(
+    "jpeg lifecycle status=%s cycles=%lu capacity=%lu "
+    "alloc_release=%s engine_create_destroy=%s detach=%s "
+    "heap_free_before=%lu heap_free_after=%lu "
+    "heap_largest_before=%lu heap_largest_after=%lu "
+    "psram_free_before=%lu psram_free_after=%lu "
+    "psram_largest_before=%lu psram_largest_after=%lu\n",
+    ready ? "passed" : "failed",
+    static_cast<unsigned long>(kLifecycleTestCycles),
+    static_cast<unsigned long>(kStillJpegCapacity),
+    allocation_cycles_ready ? "passed" : "failed",
+    encoder_cycles_ready ? "passed" : "failed",
+    detach_ready ? "passed" : "failed",
+    static_cast<unsigned long>(before.heap_free),
+    static_cast<unsigned long>(after.heap_free),
+    static_cast<unsigned long>(before.heap_largest),
+    static_cast<unsigned long>(after.heap_largest),
+    static_cast<unsigned long>(before.psram_free),
+    static_cast<unsigned long>(after.psram_free),
+    static_cast<unsigned long>(before.psram_largest),
+    static_cast<unsigned long>(after.psram_largest));
+  return ready;
 }
 
 static bool logCameraBaseline() {
@@ -199,15 +324,98 @@ static bool logCameraBaseline() {
   if (video_format_ready) {
     probeVgaOutputFormat(fd, video_format);
   }
-  logCaptureTimeoutBaseline();
-
   close(fd);
   return sensor_format_ready && video_format_ready;
+}
+
+// ESP-Video resets the per-device timeout on every open.  Configure a second
+// reference after capture_dev.begin() so the setting remains on the shared
+// driver object while capture_dev owns its descriptor.
+static bool configureActiveCaptureDequeueTimeout() {
+  const int fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
+  if (fd < 0) {
+    Serial.printf("capture timeout status=failed open_errno=%d\n", errno);
+    return false;
+  }
+
+  const bool ready = configureCaptureDequeueTimeout(fd);
+  close(fd);
+  return ready;
+}
+
+static bool runCaptureTimeoutRecoveryTest() {
+  ESPVideoBufferClass held[kCaptureBufferCount];
+  size_t held_count = 0;
+  uint32_t timeout_elapsed_us = 0;
+  int driver_errno = 0;
+  bool timeout_observed = false;
+
+  // Some sensor/driver combinations expose only one ready buffer at a time.
+  // Treat the first failed dequeue after at least one held buffer as the
+  // starvation event; if both buffers are ready, perform one extra dequeue.
+  while (held_count < kCaptureBufferCount) {
+    const uint32_t start_us = micros();
+    errno = 0;
+    ESPVideoBufferClass candidate = capture_dev.captureBuffer();
+    const uint32_t elapsed_us = micros() - start_us;
+    if (!candidate.valid()) {
+      if (held_count == 0) {
+        Serial.printf("capture timeout test status=failed stage=hold-buffer index=0 errno=%d\n",
+                      errno);
+        return false;
+      }
+      timeout_elapsed_us = elapsed_us;
+      driver_errno = errno;
+      timeout_observed = true;
+      break;
+    }
+    held[held_count++] = static_cast<ESPVideoBufferClass &&>(candidate);
+  }
+
+  if (!timeout_observed) {
+    const uint32_t start_us = micros();
+    errno = 0;
+    ESPVideoBufferClass timed_out = capture_dev.captureBuffer();
+    timeout_elapsed_us = micros() - start_us;
+    driver_errno = errno;
+    timeout_observed = !timed_out.valid();
+  }
+
+  const bool bounded = timeout_observed
+                       && timeout_elapsed_us >= 4500000U
+                       && timeout_elapsed_us <= 6500000U;
+  const bool expected_driver_result = driver_errno == EPERM
+                                      || driver_errno == ETIMEDOUT;
+
+  for (size_t i = 0; i < held_count; ++i) {
+    held[i].end();
+  }
+
+  ESPVideoBufferClass recovery = capture_dev.captureBuffer();
+  const bool recovered = recovery.valid();
+  if (recovered) {
+    recovery.end();
+  }
+
+  const bool ready = bounded && expected_driver_result && recovered;
+  Serial.printf(
+    "capture timeout test status=%s injection=hold-available-buffers "
+    "requested_ms=%lu elapsed_ms=%llu held_buffers=%u driver_errno=%d reported_errno=%d "
+    "stream_started=%s recovery_frame=%s\n",
+    ready ? "passed" : "failed",
+    static_cast<unsigned long>(kCaptureDequeueTimeoutMs),
+    static_cast<unsigned long long>(timeout_elapsed_us / 1000),
+    static_cast<unsigned>(held_count), driver_errno,
+    (bounded && expected_driver_result) ? ETIMEDOUT : driver_errno,
+    capture_dev.isCaptureStarted() ? "yes" : "no",
+    recovered ? "valid" : "invalid");
+  return ready;
 }
 
 #ifndef EXCLUDE_WIFI
 RTSPServer rtsp_server;
 bool rtsp_server_ready = false;
+bool firmware_ready = false;
 uint32_t last_wifi_reconnect_ms = 0;
 uint32_t stream_sequence = 0;
 uint32_t dropped_frames = 0;
@@ -352,6 +560,7 @@ static void serviceWirelessLink() {
   Serial.println("reconnecting Wi-Fi");
   WiFi.STA.connect(kWifiSsid, kWifiPassword);
 }
+
 #endif
 
 void setup() {
@@ -396,8 +605,16 @@ void setup() {
   Serial.printf("CSI camera initialized: %s\n",
                 video.isCSIInitialized() ? "yes" : "no");
   logSensorIdentity();
-  logCameraBaseline();
+  if (!logCameraBaseline()) {
+    Serial.println("Phase 2 gate failed: camera baseline");
+    return;
+  }
   logMemoryBaseline("camera-initialized");
+
+  if (!runJpegResourceLifecycleTest()) {
+    Serial.println("Phase 2 gate failed: JPEG resource lifecycle");
+    return;
+  }
 
   if (!capture_dev.begin(ESP_VIDEO_MIPI_CSI_DEVICE_NAME,
                          kCaptureBufferCount)) {
@@ -406,6 +623,10 @@ void setup() {
   }
   if (!capture_dev.setFormat(ESP_VIDEO_FORMAT_RGB565)) {
     Serial.println("failed to set format");
+    return;
+  }
+  if (!configureActiveCaptureDequeueTimeout()) {
+    Serial.println("Phase 2 gate failed: active dequeue timeout configuration");
     return;
   }
   Serial.printf(
@@ -418,6 +639,12 @@ void setup() {
     Serial.println("failed to start capture");
     return;
   }
+
+  if (!runCaptureTimeoutRecoveryTest()) {
+    Serial.println("Phase 2 gate failed: bounded dequeue timeout recovery");
+    return;
+  }
+
   if (!jpeg_encoder.begin(capture_dev.getWidth(), capture_dev.getHeight(),
                           kJpegQuality)) {
     Serial.println("failed to initialize JPEG encoder");
@@ -431,6 +658,7 @@ void setup() {
 
 #ifndef EXCLUDE_WIFI
   rtsp_server_ready = startRtspServer();
+  firmware_ready = true;
 #else
   Serial.println("camera ready; RTSP server excluded");
 #endif
@@ -438,6 +666,10 @@ void setup() {
 
 void loop() {
 #ifndef EXCLUDE_WIFI
+  if (!firmware_ready) {
+    delay(1000);
+    return;
+  }
   serviceWirelessLink();
   if (!rtsp_server_ready || !rtsp_server.readyToSendFrame()) {
     delay(10);
@@ -447,11 +679,17 @@ void loop() {
   const uint32_t frame_start_ms = millis();
   const uint32_t cycle_start_us = micros();
   const uint32_t capture_start_us = micros();
+  errno = 0;
   ESPVideoBufferClass frame = capture_dev.captureBuffer();
   const uint32_t capture_us = micros() - capture_start_us;
+  const int capture_errno = errno;
   if (!frame.valid()) {
     ++dropped_frames;
-    Serial.println("failed to capture buffer");
+    Serial.printf(
+      "failed to capture buffer errno=%d "
+      "capture_us=%lu\n",
+      capture_errno,
+      static_cast<unsigned long>(capture_us));
     delay(1);
     return;
   }
