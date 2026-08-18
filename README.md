@@ -8,17 +8,26 @@
 
 ## Current Prototype
 
-The ESP32 hosts a single-client RTSP server. RTSP control uses TCP port 554,
-RFC 2435 RTP/JPEG media uses UDP port 5430, and RTCP reports are accepted on
-UDP port 5431. The stream is 800x800, JPEG quality 50, and currently 10 FPS.
+The ESP32 hosts a single-client RTSP server and an HTTP settings/photo API.
+RTSP control uses TCP port 554, RFC 2435 RTP/JPEG media uses UDP port 5430,
+and RTCP reports are accepted on UDP port 5431. The stable RTSP mode is
+800x800, JPEG quality 50, and currently 10 FPS.
 
 ```text
 rtsp://<board-ip>:554/
 ```
 
-The receiver requests unicast UDP media; multicast, RTP-over-TCP, audio,
-authentication, browser playback, and multiple clients are outside this
-prototype.
+The receiver requests unicast UDP media. The web settings page is served from
+the board and supports authentication, stream settings, and photo capture.
+The RTSP stream stays on the known-good 800x800 sensor mode, while
+`POST /api/photo/capture` queues an asynchronous FHD still capture. Poll
+`GET /api/photo/metadata` until the photo state is `ready`, then download the
+published image with `GET /api/photo/latest.jpg?id=<photo-id>`.
+
+The photo transaction temporarily switches the camera pipeline to
+1920x1080 RGB565, encodes a quality-90 JPEG, restores the 800x800 RTSP mode,
+and publishes the new photo only after restoration succeeds. A capture request
+returns `202 Accepted`; clients must wait for metadata before downloading.
 
 ## Validation
 
@@ -55,6 +64,8 @@ the IPv4 `MF` flag or a nonzero fragment offset.
 ## Files
 
 - Firmware: `mipi_csi_camera/mipi_csi_camera.ino`
+- Web/API implementation: `mipi_csi_camera/photo_api.cpp`, `mipi_csi_camera/web_ui.cpp`
+- Authentication: `mipi_csi_camera/auth_manager.cpp`
 - OpenCV stream viewer: `tools/rtsp_viewer.py`
 - OpenCV receiver: `tools/rtsp_receiver.py`
 - RTP packet probe: `tools/rtp_packet_probe.py`
@@ -68,10 +79,7 @@ the IPv4 `MF` flag or a nonzero fragment offset.
 - Vendored library provenance: `mipi_csi_camera/src/rtsp_server/UPSTREAM.md`
 - Historical TCP receiver: `tools/pc_receiver.py`
 
-## Firmware implementation versions
-
-The firmware prints its implementation identifier at boot as
-`implementation version=...`.
+## Firmware implementation history
 
 | Identifier | Build format | Scope |
 | --- | --- | --- |
@@ -83,9 +91,9 @@ The firmware prints its implementation identifier at boot as
 | `v3.0-phase5-arduino` | Arduino IDE | Immutable PhotoStore ownership and replacement stress gate |
 | `v3.0-phase6-arduino` | Arduino IDE | ESP-IDF HTTP photo API and asynchronous capture queue |
 
-The current sketch is `v3.0-phase6-arduino`. Its board acceptance procedures are
-documented in `docs/PHASE3_ARDUINO_TEST.md`, `docs/PHASE4_ARDUINO_TEST.md`, and
+The current sketch combines the photo API, authenticated web settings page,
+FHD still capture, and the 800x800 RTSP baseline. The older phase identifiers
+above describe historical milestones; they are not printed by the current
+sketch. Board acceptance procedures are documented in
+`docs/PHASE3_ARDUINO_TEST.md`, `docs/PHASE4_ARDUINO_TEST.md`,
 `docs/PHASE5_ARDUINO_TEST.md`, and `docs/PHASE6_ARDUINO_TEST.md`.
-V3's later high-resolution phases
-must receive a new identifier when their behavior changes; do not reuse a phase
-identifier for a different firmware image.

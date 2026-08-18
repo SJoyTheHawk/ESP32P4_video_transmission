@@ -12,14 +12,15 @@ typedef struct {
 #include "ov5647_1080p_registers.h"
 
 const esp_cam_sensor_format_t &ov5647_1080p_sensor_format() {
-  static const esp_cam_sensor_isp_info_t isp_info = {
+  static esp_cam_sensor_isp_info_t isp_info = {
     .isp_v1_info = {
       .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
       .pclk = 81666700,
       .hts = 2416,
       .vts = 1104,
+      // The 1080p crop starts on a different Bayer phase than 800x800.
       .bayer_type = ESP_CAM_SENSOR_BAYER_GBRG,
-    },
+    }
   };
   static const esp_cam_sensor_format_t format = {
     .name = "MIPI_2lane_24Minput_RAW10_1920x1080_30fps",

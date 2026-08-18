@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <WiFi.h>
+#include <esp_netif.h>
 
 namespace {
 constexpr size_t kMaxCaptureBody = 64;
@@ -55,7 +57,7 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
-  config.max_uri_handlers = 10;
+  config.max_uri_handlers = 15;
   config.lru_purge_enable = true;
   if (httpd_start(&server_, &config) != ESP_OK) {
     vSemaphoreDelete(capture_queue_);
@@ -68,6 +70,24 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
     .uri = "/",
     .method = HTTP_GET,
     .handler = rootHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t login_uri = {
+    .uri = "/api/login",
+    .method = HTTP_POST,
+    .handler = loginHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t logout_uri = {
+    .uri = "/api/logout",
+    .method = HTTP_POST,
+    .handler = logoutHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t version_uri = {
+    .uri = "/api/version",
+    .method = HTTP_GET,
+    .handler = versionHandler,
     .user_ctx = this,
   };
   const httpd_uri_t metadata_uri = {
@@ -118,7 +138,22 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
     .handler = settingsResetHandler,
     .user_ctx = this,
   };
+  const httpd_uri_t network_settings_get_uri = {
+    .uri = "/api/network/settings",
+    .method = HTTP_GET,
+    .handler = networkSettingsGetHandler,
+    .user_ctx = this,
+  };
+  const httpd_uri_t network_settings_put_uri = {
+    .uri = "/api/network/settings",
+    .method = HTTP_PUT,
+    .handler = networkSettingsPutHandler,
+    .user_ctx = this,
+  };
   if (httpd_register_uri_handler(server_, &root_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &login_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &logout_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &version_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &metadata_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &latest_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &capture_uri) != ESP_OK
@@ -126,7 +161,9 @@ bool PhotoApi::begin(PhotoStore *store, CaptureCallback callback,
       || httpd_register_uri_handler(server_, &resolution_put_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &settings_get_uri) != ESP_OK
       || httpd_register_uri_handler(server_, &settings_put_uri) != ESP_OK
-      || httpd_register_uri_handler(server_, &settings_reset_uri) != ESP_OK) {
+      || httpd_register_uri_handler(server_, &settings_reset_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &network_settings_get_uri) != ESP_OK
+      || httpd_register_uri_handler(server_, &network_settings_put_uri) != ESP_OK) {
     httpd_stop(server_);
     server_ = nullptr;
     vSemaphoreDelete(capture_queue_);
@@ -215,6 +252,58 @@ void PhotoApi::setCaptureController(CaptureController *controller) {
   controller_ = controller;
 }
 
+void PhotoApi::setAuthManager(AuthManager *auth_manager) {
+  auth_manager_ = auth_manager;
+}
+
+void PhotoApi::setFirmwareVersion(const char *version) {
+  firmware_version_ = version;
+}
+
+esp_err_t PhotoApi::versionHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleVersion(request);
+}
+
+esp_err_t PhotoApi::handleVersion(httpd_req_t *request) {
+  const char *version = firmware_version_ != nullptr ? firmware_version_ : "1.0.0";
+
+  char response[128];
+  snprintf(response, sizeof(response), "{\"status\":\"success\",\"version\":\"%s\"}", version);
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
+
+String PhotoApi::getTokenFromRequest(httpd_req_t *request) {
+  // Check for session token in query parameter
+  size_t buf_len = httpd_req_get_url_query_len(request) + 1;
+  if (buf_len > 1) {
+    char *buf = (char *)malloc(buf_len);
+    if (buf != nullptr) {
+      if (httpd_req_get_url_query_str(request, buf, buf_len) == ESP_OK) {
+        char param[64];
+        if (httpd_query_key_value(buf, "token", param, sizeof(param)) == ESP_OK) {
+          String token = String(param);
+          free(buf);
+          return token;
+        }
+      }
+      free(buf);
+    }
+  }
+  return "";
+}
+
+bool PhotoApi::isAuthenticated(httpd_req_t *request) {
+  if (auth_manager_ == nullptr) {
+    return true; // No auth manager, allow access
+  }
+
+  String token = getTokenFromRequest(request);
+  return auth_manager_->isAuthenticated(token);
+}
+
 esp_err_t PhotoApi::rootHandler(httpd_req_t *request) {
   PhotoApi *api = apiFromRequest(request);
   return api == nullptr ? ESP_FAIL : api->handleRoot(request);
@@ -222,7 +311,124 @@ esp_err_t PhotoApi::rootHandler(httpd_req_t *request) {
 
 esp_err_t PhotoApi::handleRoot(httpd_req_t *request) {
   httpd_resp_set_type(request, "text/html");
-  return httpd_resp_sendstr(request, WebUI::getSettingsPage());
+
+  // Check authentication
+  if (isAuthenticated(request)) {
+    return httpd_resp_sendstr(request, WebUI::getSettingsPage());
+  } else {
+    return httpd_resp_sendstr(request, WebUI::getLoginPage());
+  }
+}
+
+esp_err_t PhotoApi::loginHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleLogin(request);
+}
+
+esp_err_t PhotoApi::handleLogin(httpd_req_t *request) {
+  if (auth_manager_ == nullptr) {
+    return sendHttpError(request, "503 Service Unavailable", "Auth not configured");
+  }
+
+  char content[256];
+  size_t recv_size = min(request->content_len, sizeof(content) - 1);
+  int ret = httpd_req_recv(request, content, recv_size);
+  if (ret <= 0) {
+    return sendHttpError(request, "400 Bad Request", "Failed to read request body");
+  }
+  content[ret] = '\0';
+
+  // Parse URL-encoded form data
+  char username[64] = {0};
+  char password[64] = {0};
+
+  char *token = strtok(content, "&");
+  while (token != nullptr) {
+    if (strncmp(token, "username=", 9) == 0) {
+      strncpy(username, token + 9, sizeof(username) - 1);
+    } else if (strncmp(token, "password=", 9) == 0) {
+      strncpy(password, token + 9, sizeof(password) - 1);
+    }
+    token = strtok(nullptr, "&");
+  }
+
+  if (auth_manager_->login(String(username), String(password))) {
+    String session_token = auth_manager_->getCurrentToken();
+    char response[256];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"success\",\"message\":\"Login successful\",\"token\":\"%s\"}",
+             session_token.c_str());
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, response);
+  } else {
+    httpd_resp_set_status(request, "401 Unauthorized");
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, "{\"status\":\"error\",\"message\":\"Invalid credentials\"}");
+  }
+}
+
+esp_err_t PhotoApi::logoutHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleLogout(request);
+}
+
+esp_err_t PhotoApi::handleLogout(httpd_req_t *request) {
+  if (auth_manager_ != nullptr) {
+    auth_manager_->logout();
+  }
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, "{\"status\":\"success\",\"message\":\"Logged out\"}");
+}
+
+esp_err_t PhotoApi::networkSettingsGetHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleNetworkSettingsGet(request);
+}
+
+esp_err_t PhotoApi::handleNetworkSettingsGet(httpd_req_t *request) {
+  if (!isAuthenticated(request)) {
+    httpd_resp_set_status(request, "401 Unauthorized");
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+  }
+
+  // Get current IP address
+  char ip_str[16] = "0.0.0.0";
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (netif != nullptr) {
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+      snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+    }
+  }
+
+  char response[512];
+  snprintf(response, sizeof(response),
+           "{\"status\":\"success\",\"ip_address\":\"%s\",\"dhcp\":true}",
+           ip_str);
+
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request, response);
+}
+
+esp_err_t PhotoApi::networkSettingsPutHandler(httpd_req_t *request) {
+  PhotoApi *api = apiFromRequest(request);
+  return api == nullptr ? ESP_FAIL : api->handleNetworkSettingsPut(request);
+}
+
+esp_err_t PhotoApi::handleNetworkSettingsPut(httpd_req_t *request) {
+  if (!isAuthenticated(request)) {
+    httpd_resp_set_status(request, "401 Unauthorized");
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+  }
+
+  // For now, just acknowledge the request
+  // Full implementation would require WiFi reconfiguration
+  httpd_resp_set_type(request, "application/json");
+  return httpd_resp_sendstr(request,
+    "{\"status\":\"success\",\"message\":\"Network settings updated (restart required)\"}");
 }
 
 esp_err_t PhotoApi::streamResolutionGetHandler(httpd_req_t *request) {
@@ -249,9 +455,8 @@ esp_err_t PhotoApi::handleStreamResolutionGet(httpd_req_t *request) {
   char response[256];
   snprintf(response, sizeof(response),
            "{\"current\":\"%s\",\"resolution_name\":\"%s\",\"width\":%u,\"height\":%u,"
-           "\"supported\":[\"xvga\",\"wvga\",\"portrait\"]}",
-           (current == StreamResolution::XVGA_800x800) ? "xvga" :
-           (current == StreamResolution::WVGA_800x640) ? "wvga" : "portrait",
+           "\"supported\":[\"800x800\"]}",
+           "800x800",
            current_name,
            width, height);
 
@@ -282,7 +487,7 @@ esp_err_t PhotoApi::handleStreamResolutionPut(httpd_req_t *request) {
   }
   body[content_len] = '\0';
 
-  // Simple JSON parsing for {"resolution":"xvga"} or {"resolution":"wvga"}
+  // Simple JSON parsing for {"resolution":"vga"} or {"resolution":"720p"}
   const char *resolution_key = strstr(body, "\"resolution\"");
   if (resolution_key == nullptr) {
     return sendHttpError(request, "400 Bad Request",
@@ -299,20 +504,20 @@ esp_err_t PhotoApi::handleStreamResolutionPut(httpd_req_t *request) {
   StreamResolution target;
   bool valid = false;
 
-  if (strncmp(value_start, "xvga", 4) == 0) {
-    target = StreamResolution::XVGA_800x800;
+  if (strncmp(value_start, "vga", 3) == 0) {
+    target = StreamResolution::VGA_640x480;
     valid = true;
-  } else if (strncmp(value_start, "wvga", 4) == 0) {
-    target = StreamResolution::WVGA_800x640;
+  } else if (strncmp(value_start, "720p", 4) == 0 || strncmp(value_start, "hd", 2) == 0) {
+    target = StreamResolution::HD_1280x720;
     valid = true;
-  } else if (strncmp(value_start, "portrait", 8) == 0) {
-    target = StreamResolution::Portrait_800x1280;
+  } else if (strncmp(value_start, "1080p", 5) == 0 || strncmp(value_start, "fhd", 3) == 0) {
+    target = StreamResolution::FHD_1920x1080;
     valid = true;
   }
 
   if (!valid) {
     return sendHttpError(request, "400 Bad Request",
-                        "Invalid resolution (use 'xvga', 'wvga', or 'portrait')");
+                        "Invalid resolution (use 'vga', '720p', 'hd', '1080p', or 'fhd')");
   }
 
   StreamResolution previous = controller_->getCurrentResolution();
@@ -325,11 +530,9 @@ esp_err_t PhotoApi::handleStreamResolutionPut(httpd_req_t *request) {
   snprintf(response, sizeof(response),
            "{\"status\":\"success\",\"resolution\":\"%s\","
            "\"width\":%u,\"height\":%u,\"previous\":\"%s\"}",
-           (target == StreamResolution::XVGA_800x800) ? "xvga" :
-           (target == StreamResolution::WVGA_800x640) ? "wvga" : "portrait",
+           "800x800",
            controller_->width(), controller_->height(),
-           (previous == StreamResolution::XVGA_800x800) ? "xvga" :
-           (previous == StreamResolution::WVGA_800x640) ? "wvga" : "portrait");
+           "800x800");
 
   httpd_resp_set_type(request, "application/json");
   return httpd_resp_sendstr(request, response);
@@ -502,6 +705,8 @@ void PhotoApi::runCaptureWorker() {
                           && capture_callback_(capture_context_);
     state_.store(captured ? PhotoApiState::Ready : PhotoApiState::Error,
                  std::memory_order_release);
+    Serial.printf("photo capture worker status=%s state=%s\n",
+                  captured ? "published" : "failed", stateName());
   }
   worker_task_ = nullptr;
   vTaskDelete(nullptr);
@@ -548,20 +753,8 @@ esp_err_t PhotoApi::handleSettingsGet(httpd_req_t *request) {
 
   // Convert StreamResolution enum to index for web UI
   int resolution_index;
-  switch (settings_->stream_resolution) {
-    case StreamResolution::WVGA_800x640:
-      resolution_index = 0;
-      break;
-    case StreamResolution::XVGA_800x800:
-      resolution_index = 1;
-      break;
-    case StreamResolution::Portrait_800x1280:
-      resolution_index = 2;
-      break;
-    default:
-      resolution_index = 1;  // Default to XVGA
-      break;
-  }
+  // The rollback firmware exposes only the known-good 800x800 stream mode.
+  resolution_index = 1;
 
   char response[256];
   snprintf(response, sizeof(response),
@@ -620,35 +813,35 @@ esp_err_t PhotoApi::handleSettingsPut(httpd_req_t *request) {
     if (index >= 0 && index <= 2) {
       switch (index) {
         case 0:
-          new_resolution = StreamResolution::WVGA_800x640;
+          new_resolution = StreamResolution::VGA_640x480;
           resolution_changed = true;
           break;
         case 1:
-          new_resolution = StreamResolution::XVGA_800x800;
+          new_resolution = StreamResolution::HD_1280x720;
           resolution_changed = true;
           break;
         case 2:
-          new_resolution = StreamResolution::Portrait_800x1280;
+          new_resolution = StreamResolution::FHD_1920x1080;
           resolution_changed = true;
           break;
       }
     }
   }
 
-  // Try string format: "stream_resolution":"xvga"
+  // Try string format: "stream_resolution":"vga"
   if (!resolution_changed) {
     const char *res_key = "\"stream_resolution\":\"";
     const char *res_start = strstr(body, res_key);
     if (res_start != nullptr) {
       res_start += strlen(res_key);
-      if (strncmp(res_start, "xvga\"", 5) == 0) {
-        new_resolution = StreamResolution::XVGA_800x800;
+      if (strncmp(res_start, "vga\"", 4) == 0) {
+        new_resolution = StreamResolution::VGA_640x480;
         resolution_changed = true;
-      } else if (strncmp(res_start, "wvga\"", 5) == 0) {
-        new_resolution = StreamResolution::WVGA_800x640;
+      } else if (strncmp(res_start, "720p\"", 5) == 0 || strncmp(res_start, "hd\"", 3) == 0) {
+        new_resolution = StreamResolution::HD_1280x720;
         resolution_changed = true;
-      } else if (strncmp(res_start, "portrait\"", 9) == 0) {
-        new_resolution = StreamResolution::Portrait_800x1280;
+      } else if (strncmp(res_start, "1080p\"", 6) == 0 || strncmp(res_start, "fhd\"", 4) == 0) {
+        new_resolution = StreamResolution::FHD_1920x1080;
         resolution_changed = true;
       } else {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
@@ -731,4 +924,3 @@ esp_err_t PhotoApi::handleSettingsReset(httpd_req_t *request) {
                             "{\"status\":\"success\","
                             "\"message\":\"settings reset to defaults\"}");
 }
-

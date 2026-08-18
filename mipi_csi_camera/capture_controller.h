@@ -18,9 +18,9 @@ enum class CaptureControllerState : uint8_t {
 };
 
 enum class StreamResolution : uint8_t {
-  XVGA_800x800,
-  WVGA_800x640,
-  Portrait_800x1280,
+  VGA_640x480,
+  HD_1280x720,
+  FHD_1920x1080,
 };
 
 struct HighResStillCandidate {
@@ -83,8 +83,8 @@ public:
   bool encodeBaselineFrame(const BaselineFrame &frame, JpegEncodeResult *out);
   bool runTimeoutRecoveryTest();
   bool runRestartValidation(uint32_t cycles);
-  bool run1080pCaptureValidation(uint32_t cycles);
-  bool capture1080pStill(HighResStillCandidate *candidate);
+  bool runHighResCaptureValidation(uint32_t cycles);
+  bool captureHighResStill(HighResStillCandidate *candidate);
 
   bool switchResolution(StreamResolution target);
   StreamResolution getCurrentResolution() const;
@@ -114,7 +114,7 @@ private:
   bool setRgb565Output();
   bool restoreBaseline();
   bool discardSettlingFrames(uint32_t count);
-  bool memoryGateFor1080p() const;
+  bool memoryGateForHighRes() const;
   bool jpegMatchesDimensions(const JpegEncodeResult &jpeg, uint32_t width,
                              uint32_t height) const;
   BaselineFrame dequeueFrame();
@@ -139,7 +139,7 @@ private:
   bool baseline_sensor_format_saved_ = false;
   bool stream_started_ = false;
   CaptureControllerState state_ = CaptureControllerState::Uninitialized;
-  StreamResolution current_resolution_ = StreamResolution::XVGA_800x800;
+  StreamResolution current_resolution_ = StreamResolution::HD_1280x720;
   JpegEncoderClass jpeg_encoder_;
   SemaphoreHandle_t operation_mutex_ = nullptr;
 };

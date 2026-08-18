@@ -13,14 +13,14 @@ typedef struct {
 #include "ov5647_800x800_registers.h"
 
 const esp_cam_sensor_format_t &ov5647_800x800_sensor_format() {
-  static const esp_cam_sensor_isp_info_t isp_info = {
+  static esp_cam_sensor_isp_info_t isp_info = {
     .isp_v1_info = {
       .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
       .pclk = 100000000,
-      .hts = 1896,
-      .vts = 984,
-      .bayer_type = ESP_CAM_SENSOR_BAYER_GBRG,
-    },
+      .hts = 984,
+      .vts = 1896,
+      .bayer_type = ESP_CAM_SENSOR_BAYER_BGGR,
+    }
   };
   static const esp_cam_sensor_format_t format = {
     .name = "MIPI_2lane_24Minput_RAW8_800x800_50fps",

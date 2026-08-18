@@ -243,13 +243,75 @@ const char* WebUI::getSettingsPage() {
             margin: 0;
             cursor: pointer;
         }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+        .modal.show {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+        }
+        .modal-header {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-close {
+            font-size: 28px;
+            font-weight: bold;
+            color: #aaa;
+            cursor: pointer;
+            line-height: 20px;
+        }
+        .modal-close:hover {
+            color: #000;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #2193b0;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>📷 Camera Settings</h1>
-            <button class="btn-logout" onclick="logout()">Logout</button>
+            <div>
+                <h1>📷 Camera Settings</h1>
+                <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                    Firmware: <span id="firmwareVersion">Loading...</span>
+                </div>
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn-logout" onclick="showNetworkSettings()" style="background: #17a2b8;">Network</button>
+                <button class="btn-logout" onclick="logout()">Logout</button>
+            </div>
         </div>
 
         <div id="message" class="message"></div>
@@ -262,9 +324,7 @@ const char* WebUI::getSettingsPage() {
                     <div class="form-group">
                         <label for="resolution">Resolution:</label>
                         <select id="resolution" name="resolution">
-                            <option value="0">WVGA (800x640)</option>
-                            <option value="1">XVGA (800x800)</option>
-                            <option value="2">Portrait (800x1280)</option>
+                            <option value="1">800x800</option>
                         </select>
                         <div class="hint">Select the camera resolution for video stream</div>
                         <div class="resolution-info" id="resolutionInfo">
@@ -329,6 +389,26 @@ const char* WebUI::getSettingsPage() {
         </div>
     </div>
 
+    <!-- Network Settings Modal -->
+    <div id="networkModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span>Network Settings</span>
+                <span class="modal-close" onclick="closeNetworkModal()">&times;</span>
+            </div>
+            <form id="networkForm">
+                <div class="form-group">
+                    <label for="currentIP">Current IP Address:</label>
+                    <input type="text" id="currentIP" readonly style="background: #f0f0f0;">
+                </div>
+                <div class="hint">Network configuration changes require device restart</div>
+                <div class="button-group" style="margin-top: 20px;">
+                    <button type="button" class="btn-secondary" onclick="closeNetworkModal()">Close</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         let autoRefreshInterval = null;
         let captureInProgress = false;
@@ -359,16 +439,19 @@ const char* WebUI::getSettingsPage() {
                 const data = await response.json();
 
                 // Update form fields
-                document.getElementById('resolution').value = data.stream_resolution || '1';
-                document.getElementById('quality').value = data.jpeg_quality || '50';
-                document.getElementById('qualityValue').textContent = data.jpeg_quality || '50';
+                const resolutionIndex = Number.isInteger(data.stream_resolution)
+                    ? data.stream_resolution : 1;
+                const jpegQuality = Number.isInteger(data.jpeg_quality)
+                    ? data.jpeg_quality : 50;
+                document.getElementById('resolution').value = String(resolutionIndex);
+                document.getElementById('quality').value = String(jpegQuality);
+                document.getElementById('qualityValue').textContent = String(jpegQuality);
 
                 // Update status display
-                const resNames = ['WVGA (800x640)', 'XVGA (800x800)', 'Portrait (800x1280)'];
-                const resIndex = data.stream_resolution || 1;
-                document.getElementById('currentRes').textContent = resNames[resIndex];
-                document.getElementById('statusRes').textContent = resNames[resIndex];
-                document.getElementById('statusQuality').textContent = data.jpeg_quality || '50';
+                const resNames = ['800x800', '800x800', '800x800'];
+                document.getElementById('currentRes').textContent = resNames[resolutionIndex];
+                document.getElementById('statusRes').textContent = resNames[resolutionIndex];
+                document.getElementById('statusQuality').textContent = String(jpegQuality);
 
                 showMessage('Settings loaded successfully', 'success');
             } catch (error) {
@@ -391,6 +474,23 @@ const char* WebUI::getSettingsPage() {
 
             // Update IP and RTSP URL
             updateNetworkInfo();
+
+            // Load firmware version
+            loadFirmwareVersion();
+        }
+
+        async function loadFirmwareVersion() {
+            try {
+                const response = await fetch('/api/version');
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('firmwareVersion').textContent = data.version || '1.0.0';
+                } else {
+                    document.getElementById('firmwareVersion').textContent = '1.0.0';
+                }
+            } catch (error) {
+                document.getElementById('firmwareVersion').textContent = '1.0.0';
+            }
         }
 
         async function updateNetworkInfo() {
@@ -406,9 +506,19 @@ const char* WebUI::getSettingsPage() {
                 return;
             }
             captureInProgress = true;
+            const img = document.getElementById('previewImage');
+            const placeholder = document.getElementById('previewPlaceholder');
+            // Do not leave an older frame visible while this asynchronous
+            // capture is running or if the camera reports an error.
+            img.onload = null;
+            img.onerror = null;
+            img.removeAttribute('src');
+            img.style.display = 'none';
+            placeholder.textContent = 'Capturing...';
+            placeholder.style.display = 'block';
             try {
-                // Keep the current photo ID so a completed capture can be
-                // distinguished from the photo that was already displayed.
+                // Snapshot the old ID before queueing the capture. A fast
+                // completion must still be recognized as a new photo.
                 let previousPhotoId = null;
                 try {
                     const metadataResponse = await fetch('/api/photo/metadata', {
@@ -419,8 +529,7 @@ const char* WebUI::getSettingsPage() {
                         previousPhotoId = metadata.id || null;
                     }
                 } catch (error) {
-                    // A first capture has no metadata yet; polling below will
-                    // handle that expected 404 response.
+                    // A first capture has no metadata yet.
                 }
 
                 const response = await fetch('/api/photo/capture', {
@@ -437,9 +546,6 @@ const char* WebUI::getSettingsPage() {
 
                 if (data.status === 'success' || data.status === 'capturing') {
                     const photoId = await waitForCapturedPhoto(previousPhotoId);
-                    const img = document.getElementById('previewImage');
-                    const placeholder = document.getElementById('previewPlaceholder');
-
                     img.onload = function() {
                         img.style.display = 'block';
                         placeholder.style.display = 'none';
@@ -471,7 +577,10 @@ const char* WebUI::getSettingsPage() {
         }
 
         async function waitForCapturedPhoto(previousPhotoId) {
-            const maxAttempts = 24;
+            // High-resolution capture pauses and restores the RTSP pipeline.
+            // On a busy camera this can take longer than the old 12-second
+            // client-side timeout even though the request is progressing.
+            const maxAttempts = 120;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 await new Promise(resolve => setTimeout(resolve, 500));
                 try {
@@ -573,10 +682,60 @@ const char* WebUI::getSettingsPage() {
         }
 
         async function logout() {
-            // For now, just redirect to root
-            // In a real implementation, you'd call a logout API
-            window.location.href = '/';
+            try {
+                const token = getSessionToken();
+                const response = await fetch('/api/logout?token=' + encodeURIComponent(token), {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    clearSessionToken();
+                    window.location.href = '/';
+                } else {
+                    clearSessionToken();
+                    window.location.href = '/';
+                }
+            } catch (error) {
+                clearSessionToken();
+                window.location.href = '/';
+            }
         }
+
+        // Session token management (stored in sessionStorage - cleared on tab close)
+        function setSessionToken(token) {
+            sessionStorage.setItem('auth_token', token);
+        }
+
+        function getSessionToken() {
+            return sessionStorage.getItem('auth_token') || '';
+        }
+
+        function clearSessionToken() {
+            sessionStorage.removeItem('auth_token');
+        }
+
+        // Check if authenticated on page load
+        function checkAuthentication() {
+            const token = getSessionToken();
+            if (!token) {
+                window.location.href = '/';
+                return false;
+            }
+            return true;
+        }
+
+        // Add token to all API requests
+        const originalFetch = window.fetch;
+        window.fetch = function(url, options) {
+            if (url.startsWith('/api/')) {
+                const token = getSessionToken();
+                if (token && url.indexOf('token=') === -1) {
+                    const separator = url.indexOf('?') === -1 ? '?' : '&';
+                    url = url + separator + 'token=' + encodeURIComponent(token);
+                }
+            }
+            return originalFetch(url, options);
+        };
 
         function showMessage(text, type) {
             const msgDiv = document.getElementById('message');
@@ -587,8 +746,39 @@ const char* WebUI::getSettingsPage() {
             }, 4000);
         }
 
-        // Load settings on page load
-        window.addEventListener('load', loadSettings);
+        async function showNetworkSettings() {
+            try {
+                const response = await fetch('/api/network/settings');
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('currentIP').value = data.ip_address || 'N/A';
+                    document.getElementById('networkModal').classList.add('show');
+                } else {
+                    showMessage('Failed to load network settings', 'error');
+                }
+            } catch (error) {
+                showMessage('Error loading network settings: ' + error.message, 'error');
+            }
+        }
+
+        function closeNetworkModal() {
+            document.getElementById('networkModal').classList.remove('show');
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const modal = document.getElementById('networkModal');
+            if (event.target === modal) {
+                closeNetworkModal();
+            }
+        }
+
+        // Check authentication and load settings on page load
+        window.addEventListener('load', function() {
+            if (checkAuthentication()) {
+                loadSettings();
+            }
+        });
     </script>
 </body>
 </html>
@@ -734,10 +924,16 @@ const char* WebUI::getLoginPage() {
                 const data = await response.json();
 
                 if (response.ok && data.status === 'success') {
+                    // Store session token
+                    if (data.token) {
+                        sessionStorage.setItem('auth_token', data.token);
+                    }
                     messageDiv.className = 'message success';
                     messageDiv.textContent = 'Login successful! Redirecting...';
                     setTimeout(() => {
-                        window.location.href = '/';
+                        // Redirect with token in URL
+                        const token = sessionStorage.getItem('auth_token');
+                        window.location.href = '/?token=' + encodeURIComponent(token);
                     }, 500);
                 } else {
                     messageDiv.className = 'message error';

@@ -1,11 +1,13 @@
 #include "capture_controller.h"
 #include "ov5647_1080p_mode.h"
+#include "ov5647_5mp_mode.h"
 #include "ov5647_800x800_mode.h"
-#include "ov5647_800x640_mode.h"
-#include "ov5647_800x1280_mode.h"
+#include "ov5647_640x480_mode.h"
+#include "ov5647_1280x720_mode.h"
 
 #include <errno.h>
 #include <esp_heap_caps.h>
+
 #include <esp_video_ioctl.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -14,11 +16,13 @@
 #include <unistd.h>
 
 namespace {
+// Keep RTSP at 800x800, but capture requested stills at supported FHD.
 constexpr uint32_t kHighResWidth = 1920;
 constexpr uint32_t kHighResHeight = 1080;
 constexpr uint32_t kHighResJpegQuality = 90;
 constexpr size_t kHighResBufferBytes =
   static_cast<size_t>(kHighResWidth) * kHighResHeight * 2;
+// ESP-Video requires at least two queued capture buffers when starting CSI.
 constexpr size_t kHighResBufferCount = 2;
 constexpr size_t kHighResMaxJpegBytes = 2 * 1024 * 1024;
 constexpr size_t kHighResDriverReserveBytes = 1024 * 1024;
@@ -496,7 +500,7 @@ bool CaptureController::discardSettlingFrames(uint32_t count) {
   return true;
 }
 
-bool CaptureController::memoryGateFor1080p() const {
+bool CaptureController::memoryGateForHighRes() const {
   const size_t required = kHighResBufferBytes * kHighResBufferCount
                           + kHighResBufferBytes
                           + kHighResDriverReserveBytes + kTransactionReserveBytes;
@@ -582,7 +586,7 @@ bool CaptureController::restoreBaseline() {
   return true;
 }
 
-bool CaptureController::capture1080pStill(HighResStillCandidate *candidate) {
+bool CaptureController::captureHighResStill(HighResStillCandidate *candidate) {
   if (candidate == nullptr || !isBaselineRunning()) {
     return false;
   }
@@ -591,14 +595,20 @@ bool CaptureController::capture1080pStill(HighResStillCandidate *candidate) {
       || xSemaphoreTake(operation_mutex_, portMAX_DELAY) != pdTRUE) {
     return false;
   }
-  if (!memoryGateFor1080p()) {
-    xSemaphoreGive(operation_mutex_);
-    return false;
-  }
 
   stopStream();
   releaseBuffers();
   jpeg_encoder_.end();
+
+  if (!memoryGateForHighRes()) {
+    // The baseline stream was already torn down before the memory check.
+    // Restore it before returning so a rejected request does not strand the
+    // controller in an unavailable state.
+    restoreBaseline();
+    xSemaphoreGive(operation_mutex_);
+    return false;
+  }
+
   bool ready = applySensorFormat(ov5647_1080p_sensor_format(), true)
                && width_ == kHighResWidth && height_ == kHighResHeight
                && requestAndMapBuffers(kHighResBufferCount) && startStream();
@@ -638,7 +648,7 @@ bool CaptureController::capture1080pStill(HighResStillCandidate *candidate) {
   return true;
 }
 
-bool CaptureController::run1080pCaptureValidation(uint32_t cycles) {
+bool CaptureController::runHighResCaptureValidation(uint32_t cycles) {
   if (!isBaselineRunning() || cycles == 0) {
     return false;
   }
@@ -646,11 +656,11 @@ bool CaptureController::run1080pCaptureValidation(uint32_t cycles) {
   uint32_t completed = 0;
   for (; completed < cycles && ready; ++completed) {
     HighResStillCandidate candidate;
-    ready = capture1080pStill(&candidate);
+    ready = captureHighResStill(&candidate);
     candidate.release();
   }
   Serial.printf(
-    "high-res capture validation status=%s completed=%lu requested=%lu state=%s\n",
+    "5mp capture validation status=%s completed=%lu requested=%lu state=%s\n",
     ready && completed == cycles ? "passed" : "failed",
     static_cast<unsigned long>(completed), static_cast<unsigned long>(cycles),
     stateName());
@@ -793,17 +803,21 @@ bool CaptureController::switchResolution(StreamResolution target) {
     return false;
   }
 
-  if (target == current_resolution_) {
-    Serial.printf("resolution switch: already at target=%s\n", resolutionName(target));
-    xSemaphoreGive(operation_mutex_);
-    return true;
-  }
-
   const esp_cam_sensor_format_t* target_format = getSensorFormatForResolution(target);
   if (target_format == nullptr) {
     Serial.printf("resolution switch: unsupported target=%d\n", static_cast<int>(target));
     xSemaphoreGive(operation_mutex_);
     return false;
+  }
+
+  // The enum is retained for settings compatibility, but the active sensor
+  // may have been initialized to a different mode by ESP-Video. Verify the
+  // actual dimensions before skipping the 800x800 reconfiguration.
+  if (target == current_resolution_
+      && width_ == target_format->width && height_ == target_format->height) {
+    Serial.printf("resolution switch: already at target=%s\n", resolutionName(target));
+    xSemaphoreGive(operation_mutex_);
+    return true;
   }
 
   if (!memoryGateForResolution(target)) {
@@ -947,9 +961,10 @@ bool CaptureController::isResolutionSupported(StreamResolution resolution) const
 
 const char *CaptureController::resolutionName(StreamResolution resolution) const {
   switch (resolution) {
-    case StreamResolution::XVGA_800x800: return "XVGA";
-    case StreamResolution::WVGA_800x640: return "WVGA";
-    case StreamResolution::Portrait_800x1280: return "Portrait";
+    case StreamResolution::VGA_640x480:
+    case StreamResolution::HD_1280x720:
+    case StreamResolution::FHD_1920x1080:
+      return "800x800";
     default: return "UNKNOWN";
   }
 }
@@ -957,12 +972,10 @@ const char *CaptureController::resolutionName(StreamResolution resolution) const
 const esp_cam_sensor_format_t* CaptureController::getSensorFormatForResolution(
     StreamResolution resolution) const {
   switch (resolution) {
-    case StreamResolution::XVGA_800x800:
+    case StreamResolution::VGA_640x480:
+    case StreamResolution::HD_1280x720:
+    case StreamResolution::FHD_1920x1080:
       return &ov5647_800x800_sensor_format();
-    case StreamResolution::WVGA_800x640:
-      return &ov5647_800x640_sensor_format();
-    case StreamResolution::Portrait_800x1280:
-      return &ov5647_800x1280_sensor_format();
     default:
       return nullptr;
   }

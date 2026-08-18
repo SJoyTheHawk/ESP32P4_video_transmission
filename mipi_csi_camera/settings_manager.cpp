@@ -12,7 +12,6 @@ bool SettingsManager::begin(const char* nvs_namespace) {
   }
 
   initialized_ = true;
-  Serial.printf("settings_manager: initialized namespace=%s\n", nvs_namespace);
   return true;
 }
 
@@ -33,7 +32,6 @@ bool SettingsManager::loadSettings(CameraSettings& settings) {
   size_t actual_size = prefs_.getBytesLength(kSettingsKey);
 
   if (actual_size == 0) {
-    Serial.println("settings_manager: no saved settings found");
     return false;
   }
 
@@ -55,7 +53,6 @@ bool SettingsManager::loadSettings(CameraSettings& settings) {
     return false;
   }
 
-  Serial.println("settings_manager: loaded valid settings from NVS");
   return true;
 }
 
@@ -77,7 +74,6 @@ bool SettingsManager::saveSettings(const CameraSettings& settings) {
     return false;
   }
 
-  Serial.println("settings_manager: saved settings to NVS");
   return true;
 }
 
@@ -95,6 +91,5 @@ bool SettingsManager::resetToDefaults() {
     return false;
   }
 
-  Serial.println("settings_manager: reset to defaults");
   return true;
 }

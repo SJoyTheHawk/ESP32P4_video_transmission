@@ -25,7 +25,7 @@ struct CameraSettings {
   }
 
   void setDefaults() {
-    stream_resolution = StreamResolution::XVGA_800x800;
+    stream_resolution = StreamResolution::HD_1280x720;  // legacy enum; active mode is 800x800
     jpeg_quality = 80;
     auto_start_stream = true;
     enable_background_capture = false;

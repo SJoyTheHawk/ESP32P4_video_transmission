@@ -16,6 +16,7 @@
 #include "photo_store.h"
 #include "photo_api.h"
 #include "settings_manager.h"
+#include "auth_manager.h"
 
 #ifndef EXCLUDE_WIFI
 #include <WiFi.h>
@@ -54,23 +55,19 @@ const uint16_t kRtpVideoPort = 5430;
 #error "The selected target SoC is not supported"
 #endif
 
-struct MemorySnapshot {
-  size_t heap_free;
-  size_t heap_largest;
-  size_t psram_free;
-  size_t psram_largest;
-};
-
 ESPVideoClass video;
 CaptureController capture_controller;
 PhotoStore photo_store;
 PhotoApi photo_api;
 SettingsManager settings_manager;
 CameraSettings settings;
+AuthManager auth_manager;
 
 static bool capturePhotoForApi(void *) {
   HighResStillCandidate candidate;
-  if (!capture_controller.capture1080pStill(&candidate)) {
+  if (!capture_controller.captureHighResStill(&candidate)) {
+    Serial.printf("photo capture status=failed controller_state=%s\n",
+                  capture_controller.stateName());
     return false;
   }
   DetachedJpegOutputBuffer detached = candidate.jpeg;
@@ -79,228 +76,20 @@ static bool capturePhotoForApi(void *) {
     detached, candidate.size, candidate.width, candidate.height,
     candidate.quality, candidate.captured_ms);
   if (photo == nullptr) {
+    Serial.println("photo capture status=failed reason=photo-allocation");
     return false;
   }
-  return photo_store.publish(photo);
+  const bool published = photo_store.publish(photo);
+  if (!published) {
+    Serial.println("photo capture status=failed reason=photo-publish");
+  }
+  return published;
 }
 
-// Keep this identifier stable within a phase so serial logs can be matched to
-// the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase8-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
-const uint32_t kBaselineReportIntervalMs = 5000;
 const uint32_t kCaptureDequeueTimeoutMs = 5000;
-const uint32_t kLifecycleTestCycles = 100;
-const uint32_t kHighResValidationCycles = 20;
-const uint32_t kPhotoStoreReplacementCycles = 100;
-const uint32_t kPhotoStoreReaderCount = 5;
-const size_t kStillJpegCapacity = 2 * 1024 * 1024;
-
-static MemorySnapshot captureMemorySnapshot() {
-  return {
-    ESP.getFreeHeap(),
-    ESP.getMaxAllocHeap(),
-    ESP.getFreePsram(),
-    heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-  };
-}
-
-static void logMemoryBaseline(const char *milestone) {
-  Serial.printf(
-    "memory milestone=%s heap_free=%lu heap_largest=%lu "
-    "psram_total=%lu psram_free=%lu psram_largest=%lu\n",
-    milestone,
-    static_cast<unsigned long>(ESP.getFreeHeap()),
-    static_cast<unsigned long>(ESP.getMaxAllocHeap()),
-    static_cast<unsigned long>(ESP.getPsramSize()),
-    static_cast<unsigned long>(ESP.getFreePsram()),
-    static_cast<unsigned long>(
-      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-}
-
-static bool logSensorIdentity() {
-#if CONFIG_CAMERA_OV5647 && \
-    CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR
-  if (!video.isCSIInitialized()) {
-    Serial.println("sensor identity status=failed reason=csi-not-initialized");
-    return false;
-  }
-
-  // video.begin() succeeds only after the OV5647 driver reads and validates
-  // chip-ID registers 0x300a and 0x300b.
-  Serial.println(
-    "sensor identity status=confirmed pid=0x5647 "
-    "source=esp-video-register-probe");
-  return true;
-#else
-  Serial.println(
-    "sensor identity status=unverified reason=ov5647-autodetect-disabled");
-  return false;
-#endif
-}
-
-// Kept only as Phase 2 source history until the Phase 3 hardware gate passes.
-// All active V4L2 ownership is now in CaptureController.
-#if 0
-static bool probeVgaOutputFormat(int fd,
-                                 const struct v4l2_format &original_format) {
-  if (original_format.fmt.pix.width == kVgaWidth
-      && original_format.fmt.pix.height == kVgaHeight) {
-    Serial.println(
-      "vga probe status=supported path=active-sensor-mode output=640x480");
-    return true;
-  }
-
-  struct v4l2_format requested_format = original_format;
-  requested_format.fmt.pix.width = kVgaWidth;
-  requested_format.fmt.pix.height = kVgaHeight;
-  errno = 0;
-  const int set_result = ioctl(fd, VIDIOC_S_FMT, &requested_format);
-  const int set_errno = errno;
-
-  struct v4l2_format actual_format = {};
-  actual_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  const bool readback_ready = ioctl(fd, VIDIOC_G_FMT, &actual_format) == 0;
-  const bool supported = set_result == 0 && readback_ready
-                         && actual_format.fmt.pix.width == kVgaWidth
-                         && actual_format.fmt.pix.height == kVgaHeight;
-
-  Serial.printf(
-    "vga probe status=%s requested=%lux%lu actual=%lux%lu "
-    "set_result=%d errno=%d next=%s\n",
-    supported ? "supported" : "unsupported",
-    static_cast<unsigned long>(kVgaWidth),
-    static_cast<unsigned long>(kVgaHeight),
-    static_cast<unsigned long>(
-      readback_ready ? actual_format.fmt.pix.width : 0),
-    static_cast<unsigned long>(
-      readback_ready ? actual_format.fmt.pix.height : 0),
-    set_result, set_errno,
-    supported ? "validate-hardware-output" : "add-sensor-mode");
-
-  if (set_result == 0) {
-    struct v4l2_format restore_format = original_format;
-    if (ioctl(fd, VIDIOC_S_FMT, &restore_format) != 0) {
-      Serial.printf("vga probe restore=failed errno=%d\n", errno);
-      return false;
-    }
-    Serial.println("vga probe restore=ready");
-  }
-  return supported;
-}
-
-static bool configureCaptureDequeueTimeout(int fd) {
-  struct timeval requested = {};
-  requested.tv_sec = kCaptureDequeueTimeoutMs / 1000;
-  requested.tv_usec = (kCaptureDequeueTimeoutMs % 1000) * 1000;
-
-  errno = 0;
-  const int set_result = ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &requested);
-  const int set_errno = errno;
-
-  struct timeval actual = {};
-  errno = 0;
-  const int get_result = ioctl(fd, VIDIOC_G_DQBUF_TIMEOUT, &actual);
-  const int get_errno = errno;
-  const uint64_t actual_us = static_cast<uint64_t>(actual.tv_sec) * 1000000
-                             + actual.tv_usec;
-  const uint64_t requested_us =
-    static_cast<uint64_t>(kCaptureDequeueTimeoutMs) * 1000;
-  const bool ready = set_result == 0 && get_result == 0
-                     && actual_us == requested_us;
-
-  Serial.printf(
-    "capture timeout status=%s requested_ms=%lu actual_us=%llu "
-    "set_result=%d set_errno=%d get_result=%d get_errno=%d "
-    "driver_timeout_errno=EPERM app_timeout_errno=ETIMEDOUT\n",
-    ready ? "configured" : "failed",
-    static_cast<unsigned long>(kCaptureDequeueTimeoutMs), actual_us,
-    set_result, set_errno, get_result, get_errno);
-  return ready;
-}
-#endif
-
-static bool runJpegResourceLifecycleTest() {
-  bool allocation_cycles_ready = true;
-  bool encoder_cycles_ready = true;
-  bool detach_ready = false;
-
-  // Warm up lazy driver allocations before taking the comparison baseline.
-  {
-    JpegOutputBuffer output;
-    allocation_cycles_ready = output.allocate(kStillJpegCapacity);
-  }
-  jpeg_encode_engine_cfg_t engine_config = {};
-  engine_config.timeout_ms = 40;
-  jpeg_encoder_handle_t warmup_handle = nullptr;
-  if (jpeg_new_encoder_engine(&engine_config, &warmup_handle) == ESP_OK) {
-    encoder_cycles_ready = jpeg_del_encoder_engine(warmup_handle) == ESP_OK;
-  } else {
-    encoder_cycles_ready = false;
-  }
-
-  const MemorySnapshot before = captureMemorySnapshot();
-  for (uint32_t cycle = 0;
-       cycle < kLifecycleTestCycles && allocation_cycles_ready; ++cycle) {
-    JpegOutputBuffer output;
-    allocation_cycles_ready = output.allocate(kStillJpegCapacity)
-                              && output.capacity() >= kStillJpegCapacity;
-  }
-
-  for (uint32_t cycle = 0;
-       cycle < kLifecycleTestCycles && encoder_cycles_ready; ++cycle) {
-    jpeg_encoder_handle_t handle = nullptr;
-    encoder_cycles_ready =
-      jpeg_new_encoder_engine(&engine_config, &handle) == ESP_OK;
-    if (encoder_cycles_ready) {
-      encoder_cycles_ready = jpeg_del_encoder_engine(handle) == ESP_OK;
-    }
-  }
-
-  {
-    JpegOutputBuffer output;
-    if (output.allocate(4096)) {
-      DetachedJpegOutputBuffer detached = output.detach();
-      detach_ready = !output.valid() && output.capacity() == 0
-                     && detached.data != nullptr && detached.capacity >= 4096;
-      free(detached.data);
-      output.release();
-    }
-  }
-
-  const MemorySnapshot after = captureMemorySnapshot();
-  const bool memory_ready = after.heap_free >= before.heap_free
-                            && after.heap_largest >= before.heap_largest
-                            && after.psram_free >= before.psram_free
-                            && after.psram_largest >= before.psram_largest;
-  const bool ready = allocation_cycles_ready && encoder_cycles_ready
-                     && detach_ready && memory_ready;
-
-  Serial.printf(
-    "jpeg lifecycle status=%s cycles=%lu capacity=%lu "
-    "alloc_release=%s engine_create_destroy=%s detach=%s "
-    "heap_free_before=%lu heap_free_after=%lu "
-    "heap_largest_before=%lu heap_largest_after=%lu "
-    "psram_free_before=%lu psram_free_after=%lu "
-    "psram_largest_before=%lu psram_largest_after=%lu\n",
-    ready ? "passed" : "failed",
-    static_cast<unsigned long>(kLifecycleTestCycles),
-    static_cast<unsigned long>(kStillJpegCapacity),
-    allocation_cycles_ready ? "passed" : "failed",
-    encoder_cycles_ready ? "passed" : "failed",
-    detach_ready ? "passed" : "failed",
-    static_cast<unsigned long>(before.heap_free),
-    static_cast<unsigned long>(after.heap_free),
-    static_cast<unsigned long>(before.heap_largest),
-    static_cast<unsigned long>(after.heap_largest),
-    static_cast<unsigned long>(before.psram_free),
-    static_cast<unsigned long>(after.psram_free),
-    static_cast<unsigned long>(before.psram_largest),
-    static_cast<unsigned long>(after.psram_largest));
-  return ready;
-}
 
 #if 0
 static bool logCameraBaseline() {
@@ -445,57 +234,6 @@ uint32_t stream_sequence = 0;
 uint32_t dropped_frames = 0;
 uint32_t maximum_send_us = 0;
 uint32_t maximum_cycle_us = 0;
-uint32_t baseline_window_start_ms = 0;
-uint32_t baseline_window_frames = 0;
-uint32_t baseline_window_dropped_start = 0;
-uint64_t baseline_window_jpeg_bytes = 0;
-uint64_t baseline_window_capture_us = 0;
-uint64_t baseline_window_encode_us = 0;
-uint64_t baseline_window_send_us = 0;
-
-static void recordBaselineFrame(uint32_t jpeg_size, uint32_t capture_us,
-                                uint32_t encode_us, uint32_t send_us) {
-  const uint32_t now = millis();
-  if (baseline_window_start_ms == 0) {
-    baseline_window_start_ms = now;
-    baseline_window_dropped_start = dropped_frames;
-  }
-
-  ++baseline_window_frames;
-  baseline_window_jpeg_bytes += jpeg_size;
-  baseline_window_capture_us += capture_us;
-  baseline_window_encode_us += encode_us;
-  baseline_window_send_us += send_us;
-
-  const uint32_t elapsed_ms = now - baseline_window_start_ms;
-  if (elapsed_ms < kBaselineReportIntervalMs || baseline_window_frames == 0) {
-    return;
-  }
-
-  const uint32_t fps_x100 = static_cast<uint32_t>(
-    (static_cast<uint64_t>(baseline_window_frames) * 100000) / elapsed_ms);
-  Serial.printf(
-    "baseline window_ms=%lu frames=%lu fps=%lu.%02lu "
-    "avg_jpeg_bytes=%llu avg_capture_us=%llu avg_encode_us=%llu "
-    "avg_send_us=%llu dropped=%lu\n",
-    static_cast<unsigned long>(elapsed_ms),
-    static_cast<unsigned long>(baseline_window_frames),
-    static_cast<unsigned long>(fps_x100 / 100),
-    static_cast<unsigned long>(fps_x100 % 100),
-    baseline_window_jpeg_bytes / baseline_window_frames,
-    baseline_window_capture_us / baseline_window_frames,
-    baseline_window_encode_us / baseline_window_frames,
-    baseline_window_send_us / baseline_window_frames,
-    static_cast<unsigned long>(dropped_frames - baseline_window_dropped_start));
-
-  baseline_window_start_ms = now;
-  baseline_window_frames = 0;
-  baseline_window_dropped_start = dropped_frames;
-  baseline_window_jpeg_bytes = 0;
-  baseline_window_capture_us = 0;
-  baseline_window_encode_us = 0;
-  baseline_window_send_us = 0;
-}
 
 static bool initializeWirelessLink() {
 #if CONFIG_ESP_HOSTED_ENABLED
@@ -520,19 +258,16 @@ static bool initializeWirelessLink() {
     Serial.println("failed to disable Wi-Fi modem power save");
     return false;
   }
-  Serial.println("Wi-Fi modem power save: disabled");
   if (!WiFi.STA.begin()) {
     Serial.println("failed to initialize ESP-Hosted Wi-Fi transport");
     return false;
   }
 
-  Serial.println("ESP-Hosted SDIO transport initialized");
   if (kWifiSsid[0] == '\0') {
     Serial.println("set kWifiSsid and kWifiPassword before the Wi-Fi test");
     return false;
   }
 
-  Serial.printf("connecting to Wi-Fi SSID '%s'\n", kWifiSsid);
   if (!WiFi.STA.connect(kWifiSsid, kWifiPassword)) {
     Serial.println("failed to start Wi-Fi association");
     return false;
@@ -599,19 +334,11 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  Serial.println();
-  Serial.println("OV5647 UDP RTSP/RTP-JPEG prototype");
-  Serial.printf("implementation version=%s\n", kImplementationVersion);
-  logMemoryBaseline("boot");
-
 #ifndef EXCLUDE_WIFI
   const bool wireless_ready = initializeWirelessLink();
-  Serial.printf("wireless validation: %s\n",
-                wireless_ready ? "ready" : "not ready");
   if (!wireless_ready) {
     return;
   }
-  logMemoryBaseline("wifi-ready");
 #endif
 
   ESPVideoCamConfigClass cam_config;
@@ -635,83 +362,34 @@ void setup() {
     Serial.println("failed to init CSI camera");
     return;
   }
-  Serial.printf("CSI camera initialized: %s\n",
-                video.isCSIInitialized() ? "yes" : "no");
-  logSensorIdentity();
-  if (!runJpegResourceLifecycleTest()) {
-    Serial.println("Phase 2 gate failed: JPEG resource lifecycle");
-    return;
-  }
-
   if (!capture_controller.beginBaseline(ESP_VIDEO_MIPI_CSI_DEVICE_NAME,
                                         kCaptureBufferCount, kJpegQuality,
                                         kCaptureDequeueTimeoutMs)) {
-    Serial.println("Phase 3 gate failed: controller baseline startup");
-    return;
-  }
-  Serial.printf(
-    "capture controller baseline width=%lu height=%lu format=%s buffers=%u state=%s\n",
-    static_cast<unsigned long>(capture_controller.width()),
-    static_cast<unsigned long>(capture_controller.height()),
-    capture_controller.formatName(), static_cast<unsigned>(kCaptureBufferCount),
-    capture_controller.stateName());
-  logMemoryBaseline("camera-initialized");
-  logMemoryBaseline("capture-buffers-ready");
-
-  if (!capture_controller.runTimeoutRecoveryTest()) {
-    Serial.println("Phase 2 gate failed: bounded dequeue timeout recovery");
-    return;
-  }
-  if (!capture_controller.runRestartValidation(3)) {
-    Serial.println("Phase 3 gate failed: controller restart validation");
-    return;
-  }
-  if (!capture_controller.run1080pCaptureValidation(kHighResValidationCycles)) {
-    Serial.println("Phase 4 gate failed: 1080p capture and baseline restoration");
-    return;
-  }
-  if (!runPhotoStoreValidation(kPhotoStoreReplacementCycles,
-                               kPhotoStoreReaderCount)) {
-    Serial.println("Phase 5 gate failed: photo store ownership validation");
+    Serial.println("failed to start camera capture");
     return;
   }
   if (!photo_api.begin(&photo_store, capturePhotoForApi)) {
-    Serial.println("Phase 6 gate failed: HTTP photo API startup");
+    Serial.println("failed to start HTTP photo API");
     return;
   }
   photo_api.setCaptureController(&capture_controller);
+  photo_api.setAuthManager(&auth_manager);
   Serial.println("HTTP photo API ready: port=80 routes=/api/photo/*,/api/stream/*");
-  Serial.printf("JPEG baseline quality=%lu interval_ms=%lu target_fps=%lu\n",
-                static_cast<unsigned long>(kJpegQuality),
-                static_cast<unsigned long>(kJpegIntervalMs),
-                static_cast<unsigned long>(1000 / kJpegIntervalMs));
-  logMemoryBaseline("jpeg-encoder-ready");
-
   // Phase 8: Load and apply saved settings
   if (!settings_manager.begin()) {
     Serial.println("settings_manager: failed to initialize, using defaults");
     settings.setDefaults();
+    capture_controller.switchResolution(settings.stream_resolution);
   } else if (!settings_manager.loadSettings(settings)) {
-    Serial.println("settings: no saved settings found, using defaults");
     settings.setDefaults();
     settings_manager.saveSettings(settings);
+    capture_controller.switchResolution(settings.stream_resolution);
   } else {
-    Serial.printf("settings: loaded from NVS resolution=%s quality=%u\n",
-                  capture_controller.resolutionName(settings.stream_resolution),
-                  settings.jpeg_quality);
-
-    // Apply saved resolution if different from default
-    if (settings.stream_resolution != StreamResolution::XVGA_800x800) {
-      if (capture_controller.switchResolution(settings.stream_resolution)) {
-        Serial.printf("settings: restored resolution to %s (%ux%u)\n",
-                      capture_controller.resolutionName(settings.stream_resolution),
-                      capture_controller.width(),
-                      capture_controller.height());
-      } else {
-        Serial.println("settings: failed to restore resolution, staying at default");
-        settings.stream_resolution = StreamResolution::XVGA_800x800;
-        settings_manager.saveSettings(settings);
-      }
+    // Always apply the selected mode. The rollback build maps every stream
+    // resolution to the known-good 800x800 sensor configuration.
+    if (!capture_controller.switchResolution(settings.stream_resolution)) {
+      settings.stream_resolution = StreamResolution::HD_1280x720;
+      settings_manager.saveSettings(settings);
     }
   }
   photo_api.setSettingsManager(&settings_manager, &settings);
@@ -727,23 +405,25 @@ void setup() {
 void loop() {
   if (Serial.available() > 0) {
     const int command = Serial.read();
-    if (command == 'u' || command == 'U') {
-      photo_api.setUnavailableForTest();
-      Serial.println("photo API test state=unavailable");
-    } else if (command == 'r' || command == 'R') {
-      photo_api.restoreReadyForTest();
-      Serial.println("photo API test state=ready");
-    } else if (command == 'w' || command == 'W') {
-      Serial.println("Switching to WVGA (800x640)...");
-      if (capture_controller.switchResolution(StreamResolution::WVGA_800x640)) {
+    if (command == 'v' || command == 'V') {
+      Serial.println("Switching to VGA (640x480)...");
+      if (capture_controller.switchResolution(StreamResolution::VGA_640x480)) {
         Serial.printf("Resolution switch success: now running at %ux%u\n",
                      capture_controller.width(), capture_controller.height());
       } else {
         Serial.println("Resolution switch failed");
       }
-    } else if (command == 'x' || command == 'X') {
-      Serial.println("Switching to XVGA (800x800)...");
-      if (capture_controller.switchResolution(StreamResolution::XVGA_800x800)) {
+    } else if (command == 'h' || command == 'H') {
+      Serial.println("Switching to HD (1280x720)...");
+      if (capture_controller.switchResolution(StreamResolution::HD_1280x720)) {
+        Serial.printf("Resolution switch success: now running at %ux%u\n",
+                     capture_controller.width(), capture_controller.height());
+      } else {
+        Serial.println("Resolution switch failed");
+      }
+    } else if (command == 'f' || command == 'F') {
+      Serial.println("Switching to Full HD (1920x1080)...");
+      if (capture_controller.switchResolution(StreamResolution::FHD_1920x1080)) {
         Serial.printf("Resolution switch success: now running at %ux%u\n",
                      capture_controller.width(), capture_controller.height());
       } else {
@@ -755,14 +435,6 @@ void loop() {
                      capture_controller.getCurrentResolution()),
                    capture_controller.width(),
                    capture_controller.height());
-    } else if (command == 'p' || command == 'P') {
-      Serial.println("Switching to Portrait (800x1280)...");
-      if (capture_controller.switchResolution(StreamResolution::Portrait_800x1280)) {
-        Serial.printf("Resolution switch success: now running at %ux%u\n",
-                     capture_controller.width(), capture_controller.height());
-      } else {
-        Serial.println("Resolution switch failed");
-      }
     }
   }
 #ifndef EXCLUDE_WIFI
@@ -832,26 +504,6 @@ void loop() {
   if (!send_result.sent) {
     ++dropped_frames;
   }
-
-  Serial.printf(
-    "rtp sequence=%lu width=%lu height=%lu bytes=%lu packets=%u "
-    "capture_us=%lu encode_us=%lu "
-    "send_us=%lu cycle_us=%lu max_send_us=%lu max_cycle_us=%lu "
-    "sent=%s error=%d dropped=%lu\n",
-    static_cast<unsigned long>(stream_sequence),
-    static_cast<unsigned long>(width),
-    static_cast<unsigned long>(height),
-    static_cast<unsigned long>(jpeg.size), send_result.packetCount,
-    static_cast<unsigned long>(capture_us),
-    static_cast<unsigned long>(encode_us),
-    static_cast<unsigned long>(send_us),
-    static_cast<unsigned long>(cycle_us),
-    static_cast<unsigned long>(maximum_send_us),
-    static_cast<unsigned long>(maximum_cycle_us),
-    send_result.sent ? "yes" : "no", send_result.error,
-    static_cast<unsigned long>(dropped_frames));
-
-  recordBaselineFrame(jpeg.size, capture_us, encode_us, send_us);
 
   const uint32_t elapsed_ms = millis() - frame_start_ms;
   if (elapsed_ms < kJpegIntervalMs) {
