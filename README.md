@@ -36,6 +36,9 @@ python3 tools/rtsp_receiver.py rtsp://192.168.2.57:554/
 python3 tools/rtp_packet_probe.py rtsp://192.168.2.57:554/
 ```
 
+In the viewer, press `Space` to save the current frame under
+`tools/received_frames/` with a timestamped filename. Press `q` to quit.
+
 To validate IPv4 fragmentation, start a viewer or receiver in one terminal,
 then run the capture utility in another terminal. Packet capture may require
 administrator access on macOS:
@@ -57,5 +60,24 @@ the IPv4 `MF` flag or a nonzero fragment offset.
 - RTP packet probe: `tools/rtp_packet_probe.py`
 - tcpdump fragmentation validator: `tools/tcpdump_validate_rtp.py`
 - RTSP/RTP plan and results: `docs/OV5647_UDP_RTSP_RTP_JPEG_PLAN.md`
+- High-resolution still implementation plan:
+  `docs/OV5647_HIGH_RES_STILL_CAPTURE_IMPLEMENTATION_PLAN_V3.md`
+- High-resolution still execution guide:
+  `docs/OV5647_HIGH_RES_STILL_CAPTURE_EXECUTION_GUIDE_V3.md`
 - Vendored library provenance: `mipi_csi_camera/src/rtsp_server/UPSTREAM.md`
 - Historical TCP receiver: `tools/pc_receiver.py`
+
+## Firmware implementation versions
+
+The firmware prints its implementation identifier at boot as
+`implementation version=...`.
+
+| Identifier | Build format | Scope |
+| --- | --- | --- |
+| `v3.0-phase0-arduino` | Arduino IDE | Hardware baseline diagnostics |
+| `v3.0-phase1-arduino` | Arduino IDE | Baseline-parity build and flash |
+| `v3.0-phase2-arduino` | Arduino IDE | Timed-dequeue/resource work, if supported by the installed core |
+
+The current sketch is `v3.0-phase1-arduino`. V3's later high-resolution phases
+must receive a new identifier when their behavior changes; do not reuse a phase
+identifier for a different firmware image.

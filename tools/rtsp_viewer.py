@@ -3,7 +3,9 @@
 
 import argparse
 from collections import deque
+from datetime import datetime
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -18,10 +20,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "url",
         nargs="?",
-        default="rtsp://192.168.1.140:554/",
+        default="rtsp://192.168.1.91:554/",
         help="RTSP stream URL",
     )
     parser.add_argument("--title", default="ESP32-P4 RTSP Stream")
+    parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        default=Path("tools/received_frames"),
+        help="directory for frames saved with Space (default: %(default)s)",
+    )
     return parser.parse_args()
 
 
@@ -49,7 +57,9 @@ def main() -> int:
     try:
         cv2.namedWindow(args.title, cv2.WINDOW_NORMAL)
         window_created = True
-        print(f"viewing {args.url}; press q or Esc to close")
+        print(
+            f"viewing {args.url}; press Space to save a frame or q to close"
+        )
 
         while True:
             ok, frame = capture.read()
@@ -64,8 +74,9 @@ def main() -> int:
                 fps = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
 
             height, width = frame.shape[:2]
+            display_frame = frame.copy()
             cv2.putText(
-                frame,
+                display_frame,
                 f"{width}x{height}  {fps:.1f} FPS",
                 (16, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -74,10 +85,18 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
-            cv2.imshow(args.title, frame)
+            cv2.imshow(args.title, display_frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            if key == ord(" "):
+                args.capture_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                output_path = args.capture_dir / f"rtsp_frame_{timestamp}.jpg"
+                if cv2.imwrite(str(output_path), frame):
+                    print(f"saved frame: {output_path}", flush=True)
+                else:
+                    print(f"failed to save frame: {output_path}", file=sys.stderr)
+            elif key in (ord("q"), 27):
                 break
             if cv2.getWindowProperty(args.title, cv2.WND_PROP_VISIBLE) < 1:
                 break

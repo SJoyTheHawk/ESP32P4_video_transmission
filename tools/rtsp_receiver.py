@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "url",
         nargs="?",
-        default="rtsp://192.168.1.140:554/",
+        default="rtsp://192.168.1.91:554/",
         help="RTSP stream URL",
     )
     parser.add_argument("--duration", type=float, default=120.0)
