@@ -11,12 +11,7 @@
 #include <ESP_Video.h>
 #include <errno.h>
 #include <esp_heap_caps.h>
-#include <esp_video_ioctl.h>
-#include <fcntl.h>
-#include <sys/time.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include "jpeg_encoder.h"
+#include "capture_controller.h"
 #include "jpeg_output_buffer.h"
 
 #ifndef EXCLUDE_WIFI
@@ -57,21 +52,19 @@ const uint16_t kRtpVideoPort = 5430;
 #endif
 
 ESPVideoClass video;
-ESPVideoCaptureDevClass capture_dev;
-JpegEncoderClass jpeg_encoder;
+CaptureController capture_controller;
 
 // Keep this identifier stable within a phase so serial logs can be matched to
 // the implementation and build format that produced them.
-static constexpr char kImplementationVersion[] = "v3.0-phase2-arduino";
+static constexpr char kImplementationVersion[] = "v3.0-phase4-arduino";
 const size_t kCaptureBufferCount = 2;
 const uint32_t kJpegQuality = 50;
 const uint32_t kJpegIntervalMs = 100;
 const uint32_t kBaselineReportIntervalMs = 5000;
 const uint32_t kCaptureDequeueTimeoutMs = 5000;
 const uint32_t kLifecycleTestCycles = 100;
+const uint32_t kHighResValidationCycles = 20;
 const size_t kStillJpegCapacity = 2 * 1024 * 1024;
-const uint32_t kVgaWidth = 640;
-const uint32_t kVgaHeight = 480;
 
 struct MemorySnapshot {
   size_t heap_free;
@@ -123,6 +116,9 @@ static bool logSensorIdentity() {
 #endif
 }
 
+// Kept only as Phase 2 source history until the Phase 3 hardware gate passes.
+// All active V4L2 ownership is now in CaptureController.
+#if 0
 static bool probeVgaOutputFormat(int fd,
                                  const struct v4l2_format &original_format) {
   if (original_format.fmt.pix.width == kVgaWidth
@@ -199,6 +195,7 @@ static bool configureCaptureDequeueTimeout(int fd) {
     set_result, set_errno, get_result, get_errno);
   return ready;
 }
+#endif
 
 static bool runJpegResourceLifecycleTest() {
   bool allocation_cycles_ready = true;
@@ -280,6 +277,7 @@ static bool runJpegResourceLifecycleTest() {
   return ready;
 }
 
+#if 0
 static bool logCameraBaseline() {
   const int fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
   if (fd < 0) {
@@ -411,6 +409,7 @@ static bool runCaptureTimeoutRecoveryTest() {
     recovered ? "valid" : "invalid");
   return ready;
 }
+#endif
 
 #ifndef EXCLUDE_WIFI
 RTSPServer rtsp_server;
@@ -489,6 +488,14 @@ static bool initializeWirelessLink() {
     Serial.println("failed to configure ESP-Hosted SDIO pins");
     return false;
   }
+  // Configure this before STA.begin() so Arduino applies WIFI_PS_NONE on the
+  // STA-start event. RTP/JPEG is emitted in short UDP bursts and needs the C6
+  // radio awake to reduce observed packet loss.
+  if (!WiFi.setSleep(false)) {
+    Serial.println("failed to disable Wi-Fi modem power save");
+    return false;
+  }
+  Serial.println("Wi-Fi modem power save: disabled");
   if (!WiFi.STA.begin()) {
     Serial.println("failed to initialize ESP-Hosted Wi-Fi transport");
     return false;
@@ -566,6 +573,7 @@ static void serviceWirelessLink() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
   Serial.println();
   Serial.println("OV5647 UDP RTSP/RTP-JPEG prototype");
   Serial.printf("implementation version=%s\n", kImplementationVersion);
@@ -605,49 +613,36 @@ void setup() {
   Serial.printf("CSI camera initialized: %s\n",
                 video.isCSIInitialized() ? "yes" : "no");
   logSensorIdentity();
-  if (!logCameraBaseline()) {
-    Serial.println("Phase 2 gate failed: camera baseline");
-    return;
-  }
-  logMemoryBaseline("camera-initialized");
-
   if (!runJpegResourceLifecycleTest()) {
     Serial.println("Phase 2 gate failed: JPEG resource lifecycle");
     return;
   }
 
-  if (!capture_dev.begin(ESP_VIDEO_MIPI_CSI_DEVICE_NAME,
-                         kCaptureBufferCount)) {
-    Serial.println("failed to open capture device");
-    return;
-  }
-  if (!capture_dev.setFormat(ESP_VIDEO_FORMAT_RGB565)) {
-    Serial.println("failed to set format");
-    return;
-  }
-  if (!configureActiveCaptureDequeueTimeout()) {
-    Serial.println("Phase 2 gate failed: active dequeue timeout configuration");
+  if (!capture_controller.beginBaseline(ESP_VIDEO_MIPI_CSI_DEVICE_NAME,
+                                        kCaptureBufferCount, kJpegQuality,
+                                        kCaptureDequeueTimeoutMs)) {
+    Serial.println("Phase 3 gate failed: controller baseline startup");
     return;
   }
   Serial.printf(
-    "capture baseline width=%lu height=%lu format=%s buffers=%u\n",
-    static_cast<unsigned long>(capture_dev.getWidth()),
-    static_cast<unsigned long>(capture_dev.getHeight()),
-    capture_dev.getFormatName(), static_cast<unsigned>(kCaptureBufferCount));
+    "capture controller baseline width=%lu height=%lu format=%s buffers=%u state=%s\n",
+    static_cast<unsigned long>(capture_controller.width()),
+    static_cast<unsigned long>(capture_controller.height()),
+    capture_controller.formatName(), static_cast<unsigned>(kCaptureBufferCount),
+    capture_controller.stateName());
+  logMemoryBaseline("camera-initialized");
   logMemoryBaseline("capture-buffers-ready");
-  if (!capture_dev.startCapture()) {
-    Serial.println("failed to start capture");
-    return;
-  }
 
-  if (!runCaptureTimeoutRecoveryTest()) {
+  if (!capture_controller.runTimeoutRecoveryTest()) {
     Serial.println("Phase 2 gate failed: bounded dequeue timeout recovery");
     return;
   }
-
-  if (!jpeg_encoder.begin(capture_dev.getWidth(), capture_dev.getHeight(),
-                          kJpegQuality)) {
-    Serial.println("failed to initialize JPEG encoder");
+  if (!capture_controller.runRestartValidation(3)) {
+    Serial.println("Phase 3 gate failed: controller restart validation");
+    return;
+  }
+  if (!capture_controller.run1080pCaptureValidation(kHighResValidationCycles)) {
+    Serial.println("Phase 4 gate failed: 1080p capture and baseline restoration");
     return;
   }
   Serial.printf("JPEG baseline quality=%lu interval_ms=%lu target_fps=%lu\n",
@@ -680,7 +675,7 @@ void loop() {
   const uint32_t cycle_start_us = micros();
   const uint32_t capture_start_us = micros();
   errno = 0;
-  ESPVideoBufferClass frame = capture_dev.captureBuffer();
+  CaptureController::BaselineFrame frame = capture_controller.captureBaselineFrame();
   const uint32_t capture_us = micros() - capture_start_us;
   const int capture_errno = errno;
   if (!frame.valid()) {
@@ -694,8 +689,8 @@ void loop() {
     return;
   }
 
-  const uint32_t width = frame.getWidth();
-  const uint32_t height = frame.getHeight();
+  const uint32_t width = frame.width();
+  const uint32_t height = frame.height();
   const size_t expected_size = static_cast<size_t>(width) * height * 2;
   if (frame.data() == nullptr || frame.size() < expected_size) {
     ++dropped_frames;
@@ -707,7 +702,7 @@ void loop() {
 
   JpegEncodeResult jpeg;
   const uint32_t encode_start_us = micros();
-  const bool encoded = jpeg_encoder.encode(frame.data(), expected_size, &jpeg);
+  const bool encoded = capture_controller.encodeBaselineFrame(frame, &jpeg);
   const uint32_t encode_us = micros() - encode_start_us;
   const bool valid_jpeg = encoded && jpeg.size >= 4
                           && jpeg.data[0] == 0xff && jpeg.data[1] == 0xd8

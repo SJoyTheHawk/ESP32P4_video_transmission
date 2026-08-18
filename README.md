@@ -78,8 +78,11 @@ The firmware prints its implementation identifier at boot as
 | `v3.0-phase0-arduino` | Arduino IDE | Hardware baseline diagnostics |
 | `v3.0-phase1-arduino` | Arduino IDE | Baseline-parity build and flash |
 | `v3.0-phase2-arduino` | Arduino IDE | Bounded dequeue compatibility and JPEG resource lifecycle gates |
+| `v3.0-phase3-arduino` | Arduino IDE | CaptureController baseline-parity gates |
+| `v3.0-phase4-arduino` | Arduino IDE | 1080p RGB565 still transaction and baseline restoration |
 
-The current sketch is `v3.0-phase2-arduino`. Its board acceptance procedure is
-documented in `docs/PHASE2_ARDUINO_TEST.md`. V3's later high-resolution phases
+The current sketch is `v3.0-phase4-arduino`. Its board acceptance procedures are
+documented in `docs/PHASE3_ARDUINO_TEST.md` and `docs/PHASE4_ARDUINO_TEST.md`.
+V3's later high-resolution phases
 must receive a new identifier when their behavior changes; do not reuse a phase
 identifier for a different firmware image.
